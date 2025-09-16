@@ -97648,14 +97648,5 @@
     "humidity": 61.1,
     "air_quality_raw": 272,
     "timestamp": "2025-09-16T01:49:03.127455+02:00"
-  },
-  {
-    "light": 88.3,
-    "acceleration": 9.98,
-    "distance_mm": 109,
-    "temperature": 30.7,
-    "humidity": 61.1,
-    "air_quality_raw": 271,
-    "timestamp": "2025-09-16T01:49:04.325621+02:00"
   }
 ]

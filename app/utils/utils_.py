@@ -1,18 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 Core agente con LangChain + Ollama (OpenAI-compat) e streaming eventi.
-➤ Selezione modalità: 'env' (Report Ambientale), 'social' (Report Sociale), 'dss' (Analisi DSS/AHP)
 
-- NON passiamo base_url/api_key a ChatOpenAI: letti da ENV
+- NON passiamo base_url/api_key a ChatOpenAI: vengono letti da ENV.
   * OPENAI_BASE_URL (default: http://localhost:11434/v1)
   * OPENAI_API_KEY  (default: "ollama")
-- Modello da ENV OLLAMA_MODEL (default: "qwen3:30b")
-- Ogni modalità usa:
-  • un proprio System Message (AGENT_ENV_SYSTEM_MESSAGE, AGENT_SOC_SYSTEM_MESSAGE, AGENT_DSS_SYSTEM_MESSAGE)
-  • il set di tool minimo necessario:
-      env  → [env_kpi_snapshot_tool]
-      social → [social_kpi_snapshot_tool]
-      dss  → [dss_compute_tool]
+- Modello da ENV OLLAMA_MODEL (default: "qwen3:8b")
+- Tool "get_weather" come StructuredTool (Pydantic)
 - Async generator che emette eventi per la UI:
     {"type": "token",      "text": "..."}                      # chunk testo
     {"type": "tool_start", "name": "...", "inputs": {...}, "run_id": "..."}
@@ -30,25 +24,11 @@ from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import StructuredTool
 from langchain_core.messages import HumanMessage
 
-# Import dei TRE system message separati
-from .system_message import (
-    AGENT_ENV_SYSTEM_MESSAGE,
-    AGENT_SOC_SYSTEM_MESSAGE,
-    AGENT_DSS_SYSTEM_MESSAGE,
-)
-
-# Import dei tool (uno per modalità)
-from .tools import (
-    env_kpi_snapshot_tool,
-    social_kpi_snapshot_tool,
-    dss_compute_tool,
-    read_social_kpis_tool,
-    read_kpi_targets_tool,
-    read_data_by_time_tool
-)
-from .tools_ import read_last_n_tool
+from .system_message import AGENT_SYSTEM_MESSAGE
+from .tools import TOOLS
 
 # --------------------------------------------------------------------------
 # ENV / fallback per Ollama OpenAI-compat (nessuna vera API key richiesta)
@@ -62,73 +42,35 @@ HIDE_THINK = os.environ.get("HIDE_THINK", "true").lower() in ("1", "true", "yes"
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
+
 # --------------------------------------------------------------------------
-# LLM condiviso
+# COSTRUZIONE AGENTE
 # --------------------------------------------------------------------------
 _llm = ChatOpenAI(
-    model_name=MODEL,     # alias per la tua classe
+    model_name=MODEL,            # alias di model_name nella tua classe
     temperature=TEMPERATURE,
-    streaming=True,       # token streaming
+    streaming=True,              # token streaming
 )
 
-# --------------------------------------------------------------------------
-# Config per modalità → system_message, tools, run_name
-# --------------------------------------------------------------------------
-Mode = Literal["env", "social", "dss"]
+_system_message = AGENT_SYSTEM_MESSAGE
 
-_MODE_CONFIG = {
-    "env": {
-        "system_message": AGENT_ENV_SYSTEM_MESSAGE,
-        "tools": [env_kpi_snapshot_tool, read_last_n_tool, read_data_by_time_tool], #, read_kpi_targets_tool],
-        "run_name": "ENV-Agent",
-    },
-    "social": {
-        "system_message": AGENT_SOC_SYSTEM_MESSAGE,
-        "tools": [social_kpi_snapshot_tool, read_social_kpis_tool], #, read_kpi_targets_tool],
-        "run_name": "SOC-Agent",
-    },
-    "dss": {
-        "system_message": AGENT_DSS_SYSTEM_MESSAGE,
-        "tools": [dss_compute_tool],
-        "run_name": "DSS-Agent",
-    },
-}
+_prompt = ChatPromptTemplate.from_messages([
+    ("system",_system_message),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}"),
+    MessagesPlaceholder("agent_scratchpad"),
+])
 
-# Cache esecutori per modalità
-_EXECUTORS: dict[str, AgentExecutor] = {}
-_RUN_NAME_BY_MODE: dict[str, str] = {}
+_tools = TOOLS
+_agent = create_tool_calling_agent(_llm, _tools, _prompt)
+_executor: AgentExecutor = AgentExecutor(agent=_agent, tools=_tools).with_config({"run_name": "Agent"})
 
-def _build_executor(mode: Mode) -> AgentExecutor:
-    """Costruisce (e cache) un AgentExecutor per la modalità indicata."""
-    if mode in _EXECUTORS:
-        return _EXECUTORS[mode]
-
-    cfg = _MODE_CONFIG.get(mode)
-    if not cfg:
-        raise ValueError(f"Modalità non valida: {mode}. Valori ammessi: env | social | dss")
-
-    system_message = cfg["system_message"]
-    tools = cfg["tools"]
-    run_name = cfg["run_name"]
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_message),
-        MessagesPlaceholder("chat_history"),
-        ("human", "{input}"),
-        MessagesPlaceholder("agent_scratchpad"),
-    ])
-
-    agent = create_tool_calling_agent(_llm, tools, prompt)
-    executor: AgentExecutor = AgentExecutor(agent=agent, tools=tools).with_config({"run_name": run_name})
-
-    _EXECUTORS[mode] = executor
-    _RUN_NAME_BY_MODE[mode] = run_name
-    return executor
 
 def _strip_think(text: str) -> str:
     if HIDE_THINK and text:
         return _THINK_RE.sub("", text)
     return text
+
 
 def _normalize_tool_inputs(data: dict) -> dict:
     """
@@ -143,30 +85,22 @@ def _normalize_tool_inputs(data: dict) -> dict:
         return data["input"]
     return {}
 
+
 # --------------------------------------------------------------------------
 # EVENT STREAM: genera eventi strutturati per la UI
 #   - chat_history: lista di dizionari [{"role":"user"|"assistant","content":"..."}]
-#   - mode: 'env' | 'social' | 'dss' → seleziona system message e tools specifici
 # --------------------------------------------------------------------------
-async def event_stream(user_text: str, chat_history: list[dict], mode: Mode = "env") -> AsyncIterator[dict]:
-    """Async generator di eventi per Streamlit, con selettore di modalità (env|social|dss)."""
-    # Costruisci executor specifico per modalità
-    try:
-        executor = _build_executor(mode)
-        run_name = _RUN_NAME_BY_MODE.get(mode, "Agent")
-    except Exception as e:
-        yield {"type": "error", "message": f"Errore inizializzazione agente ({mode}): {e}"}
-        return
-
+async def event_stream(user_text: str, chat_history: list[dict]) -> AsyncIterator[dict]:
+    """Async generator di eventi per Streamlit."""
     # Converti la history "plain" in LangChain messages (solo Human per semplicità).
     lc_history = []
     for m in chat_history:
         if m.get("role") == "user":
             lc_history.append(HumanMessage(content=m.get("content", "")))
-        # (Opzionale) Aggiungere AIMessage se serve più contesto
+        # Potresti aggiungere anche AIMessage per contesti più ricchi.
 
     try:
-        async for event in executor.astream_events(
+        async for event in _executor.astream_events(
             {"input": user_text, "chat_history": lc_history},
             version="v2",
         ):
@@ -212,11 +146,12 @@ async def event_stream(user_text: str, chat_history: list[dict], mode: Mode = "e
                 }
 
             # --- CHIUSURA CHAIN ---
-            elif etype == "on_chain_end" and (name == run_name or event.get("metadata", {}).get("name") == run_name):
+            elif etype == "on_chain_end" and (name == "Agent" or event.get("metadata", {}).get("name") == "Agent"):
                 yield {"type": "done"}
 
     except Exception as e:
         yield {"type": "error", "message": str(e)}
+
 
 __all__ = [
     "event_stream",
