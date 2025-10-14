@@ -1,52 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-Sezione Editor Target KPI (cross-platform):
+Sezione Editor Target KPI:
 - Visualizza e permette di modificare il JSON dei target/soglie
 - Pulsante SALVA che valida e scrive su file
-- Autodiscovery di PROJECT_ROOT e app/data, override via ENV
 """
-from __future__ import annotations
 import os
 import json
-from pathlib import Path
 import streamlit as st
 
-# opzionale .e
-def _guess_project_root() -> Path:
-    pr_env = os.getenv("PROJECT_ROOT")
-    if pr_env:
-        p = Path(pr_env).expanduser().resolve()
-        if p.exists():
-            return p
-    cwd = Path.cwd().resolve()
-    if (cwd / "app" / "data").exists() or (cwd / ".env").exists():
-        return cwd
-    here = Path(__file__).resolve()
-    for p in (here, *here.parents):
-        if (p / "app" / "data").exists() or (p / ".env").exists():
-            return p
-    for p in here.parents:
-        if p.name.lower() == "jetson-agent":
-            return p
-    return cwd
+KPI_TARGETS_PATH = os.environ.get(
+    "KPI_TARGETS_PATH",
+    "C:\\Users\\info\\Desktop\\work_space\\repositories\\jetson-agent\\app\\data\\kpi_targets.json",
+)
 
-PROJECT_ROOT: Path = _guess_project_root()
-DATA_DIR: Path = Path(os.getenv("DATA_DIR", PROJECT_ROOT / "app" / "data"))
-
-def _resolve_path_from_env(env_key: str, default_filename: str) -> Path:
-    val = os.getenv(env_key)
-    return Path(val).expanduser().resolve() if val else (DATA_DIR / default_filename)
-
-KPI_TARGETS_PATH: Path = _resolve_path_from_env("KPI_TARGETS_PATH", "kpi_targets.json")
-
-def _read_json_text(path: Path) -> str:
-    if not path.exists():
-        # template minimo se assente (i tool lo bootstrapperanno comunque)
+def _read_json_text(path: str) -> str:
+    if not os.path.exists(path):
+        # se assente mostra un template minimo (i tool lo bootstrapperanno comunque)
         return json.dumps({
             "environment": {"trend_epsilon": 0.1, "trend_window_n": 5},
             "social": {"trend_epsilon": 0.1, "trend_window_n": 3}
         }, ensure_ascii=False, indent=2)
-    with path.open("r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f:
         try:
             data = json.load(f)
             return json.dumps(data, ensure_ascii=False, indent=2)
@@ -54,17 +28,17 @@ def _read_json_text(path: Path) -> str:
             f.seek(0)
             return f.read()
 
-def _write_json_text(path: Path, text: str) -> None:
+def _write_json_text(path: str, text: str) -> None:
     data = json.loads(text)  # valida
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def render_targets_editor_page():
     st.title("🎯 Editor Target KPI")
     st.caption("Modifica direttamente il file JSON dei target; i tool lo ricaricheranno a runtime.")
 
-    st.markdown(f"**Percorso file (rilevato):** `{KPI_TARGETS_PATH}`")
+    st.markdown(f"**Percorso file:** `{KPI_TARGETS_PATH}`")
     text = st.text_area(
         "Contenuto JSON",
         value=_read_json_text(KPI_TARGETS_PATH),
@@ -74,7 +48,7 @@ def render_targets_editor_page():
 
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("💾 Salva", type="primary"):
+        if st.button("💾 Salva"):
             try:
                 _write_json_text(KPI_TARGETS_PATH, text)
                 st.success("Target KPI salvati correttamente.")
