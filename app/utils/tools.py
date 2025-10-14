@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import json
 import math
+from pathlib import Path
 import statistics
 from typing import List, Dict, Any, Optional, Tuple, Literal
 from datetime import datetime, date
@@ -35,9 +36,45 @@ from .dss_utils import _status_to_norm01, FIN_KPI_ORDER, _ahp_weights_and_cr, EN
 # ─────────────────────────────────────────────────────────────────────────────
 # PATH (puoi sovrascrivere via ENV)
 # ─────────────────────────────────────────────────────────────────────────────
-SENSOR_DATA_PATH = os.environ.get("SENSOR_DATA_PATH", "C:\\Users\\info\\Desktop\\work_space\\repositories\\jetson-agent\\app\\data\\dati_sensori.json")
-SOCIAL_DATA_PATH = os.environ.get("SOCIAL_DATA_PATH", "C:\\Users\\info\\Desktop\\work_space\\repositories\\jetson-agent\\app\\data\\social_kpis.json")
-KPI_TARGETS_PATH = os.environ.get("KPI_TARGETS_PATH", "C:\\Users\\info\\Desktop\\work_space\\repositories\\jetson-agent\\app\\data\\kpi_targets.json")
+def _guess_project_root() -> Path:
+    """
+    Heuristics:
+    1) PROJECT_ROOT se definita in ENV
+    2) directory corrente (WorkingDirectory del servizio systemd)
+    3) cammina su per le cartelle da __file__ cercando .env o 'app/data'
+    4) fallback: prima cartella antenata chiamata 'jetson-agent', se esiste
+    """
+    # 1) ENV esplicita
+    pr_env = os.getenv("PROJECT_ROOT")
+    if pr_env:
+        p = Path(pr_env).expanduser().resolve()
+        if p.exists():
+            return p
+
+    # 2) CWD (utile con systemd: WorkingDirectory=/home/administrator/jetson-agent)
+    cwd = Path.cwd().resolve()
+    if (cwd / "app" / "data").exists() or (cwd / ".env").exists():
+        return cwd
+
+    # 3) Cammina dai file sorgente
+    here = Path(__file__).resolve()
+    for p in (here, *here.parents):
+        if (p / "app" / "data").exists() or (p / ".env").exists():
+            return p
+
+    # 4) Repo name
+    for p in here.parents:
+        if p.name.lower() == "jetson-agent":
+            return p
+
+    return cwd  # extrema ratio
+
+PROJECT_ROOT = _guess_project_root()
+DATA_DIR = Path(os.getenv("DATA_DIR", PROJECT_ROOT / "app" / "data"))
+
+SENSOR_DATA_PATH = Path(os.getenv("SENSOR_DATA_PATH", DATA_DIR / "dati_sensori.json"))
+SOCIAL_DATA_PATH = Path(os.getenv("SOCIAL_DATA_PATH", DATA_DIR / "social_kpis.json"))
+KPI_TARGETS_PATH = Path(os.getenv("KPI_TARGETS_PATH", DATA_DIR / "kpi_targets.json"))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DEFAULT TARGETS (bootstrap se file mancante)
@@ -92,10 +129,10 @@ def _wrap_args(model_cls, impl_fn):
 # Utility: file targets
 # ─────────────────────────────────────────────────────────────────────────────
 def _ensure_targets_file():
-    os.makedirs(os.path.dirname(KPI_TARGETS_PATH) or ".", exist_ok=True)
-    if not os.path.exists(KPI_TARGETS_PATH):
-        with open(KPI_TARGETS_PATH, "w", encoding="utf-8") as f:
-            json.dump(_DEFAULT_TARGETS, f, ensure_ascii=False, indent=2)
+    KPI_TARGETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not KPI_TARGETS_PATH.exists():
+        KPI_TARGETS_PATH.write_text(json.dumps(_DEFAULT_TARGETS, ensure_ascii=False, indent=2), encoding="utf-8")
+
 
 def _load_targets() -> Dict[str, Any]:
     _ensure_targets_file()
@@ -106,21 +143,21 @@ def _load_targets() -> Dict[str, Any]:
 # Utility: caricamento dataset
 # ─────────────────────────────────────────────────────────────────────────────
 def _load_env_rows() -> List[Dict[str, Any]]:
-    if not os.path.exists(SENSOR_DATA_PATH):
+    if not SENSOR_DATA_PATH.exists():
         return []
-    with open(SENSOR_DATA_PATH, "r", encoding="utf-8") as f:
+    with SENSOR_DATA_PATH.open("r", encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, list):
         return []
-    # ordina crescente per timestamp e poi ritorna lista
     data = [r for r in data if isinstance(r, dict) and "timestamp" in r]
     data.sort(key=lambda r: r["timestamp"])
     return data
 
+
 def _load_social_rows() -> List[Dict[str, Any]]:
-    if not os.path.exists(SOCIAL_DATA_PATH):
+    if not SOCIAL_DATA_PATH.exists():
         return []
-    with open(SOCIAL_DATA_PATH, "r", encoding="utf-8") as f:
+    with SOCIAL_DATA_PATH.open("r", encoding="utf-8") as f:
         data = json.load(f)
     return data if isinstance(data, list) else []
 
