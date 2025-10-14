@@ -139,7 +139,7 @@ def render_chat_page():
         with cols[0]:
             if st.button("🧹 Svuota chat"):
                 st.session_state.messages = []
-                st.experimental_rerun()
+                st.rerun()
         with cols[1]:
             st.caption("La history resta invariata quando cambi agente.")
 

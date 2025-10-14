@@ -37,7 +37,7 @@ def _truncate64(value: Any) -> str:
             s = str(value)
     except Exception:
         s = repr(value)
-    return s[:64] + ".....(OUTPUT TRONCATO A 64 CARATTERI, SE SI NECESSITA NUOVAMENTE L'OUTPUT INTEGRALE ALLORA RIESEGUIRE LOS TRUMENTO!)"
+    return s#[:64] + ".....(OUTPUT TRONCATO A 64 CARATTERI, SE SI NECESSITA NUOVAMENTE L'OUTPUT INTEGRALE ALLORA RIESEGUIRE LOS TRUMENTO!)"
 
 def _hidden_tool_trace_for_msg(msg: Dict[str, Any]) -> str:
     """

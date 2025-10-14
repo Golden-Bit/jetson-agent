@@ -264,9 +264,9 @@ def kpi_snapshot(window_n: Optional[int] = None,
         "score": {"value": score, "rating": rating},
     }
 
-kpi_snapshot_tool = StructuredTool.from_function(
+env_kpi_snapshot_tool = StructuredTool.from_function(
     func=kpi_snapshot,
-    name="kpi_snapshot",
+    name="env_kpi_snapshot",
     description="(Ambientale) KPI correnti e trend su finestra (targets letti dal JSON esterno).",
     args_schema=KpiSnapshotArgs,
 )
@@ -549,18 +549,243 @@ read_kpi_targets_tool = StructuredTool.from_function(
     args_schema=ReadKpiTargetsArgs,
 )
 
+
+
+
+
+
+
+########################################################################################################################
+# ─────────────────────────────────────────────────────────────────────────────
+# DSS (AHP) — unico tool che combina Ambientale + Sociale (+Economico neutro)
+# ─────────────────────────────────────────────────────────────────────────────
+from math import isfinite
+
+# Random Index (Saaty) per la Consistency Ratio
+_RI = {1: 0.00, 2: 0.00, 3: 0.58, 4: 0.90, 5: 1.12, 6: 1.24, 7: 1.32, 8: 1.41, 9: 1.45, 10: 1.49}
+
+def _is_square(m: List[List[float]]) -> bool:
+    return isinstance(m, list) and len(m) > 0 and all(isinstance(r, list) and len(r) == len(m) for r in m)
+
+def _power_method(matrix: List[List[float]], iters: int = 100, tol: float = 1e-9) -> Tuple[List[float], float]:
+    """Calcola l'autovettore principale (normalizzato) e lambda_max con met. delle potenze (senza numpy)."""
+    n = len(matrix)
+    v = [1.0 / n] * n
+    for _ in range(iters):
+        # w = M @ v
+        w = [sum(matrix[i][j] * v[j] for j in range(n)) for i in range(n)]
+        s = sum(w)
+        if s == 0:
+            # matrice degenerata → uniform
+            return [1.0 / n] * n, 1.0
+        v_new = [x / s for x in w]
+        # stima lambda_max (Rayleigh) come media dei rapporti (M v)_i / v_i
+        ratios = []
+        for i in range(n):
+            if v_new[i] > 0:
+                mv_i = sum(matrix[i][j] * v_new[j] for j in range(n))
+                ratios.append(mv_i / v_new[i])
+        lam = sum(ratios) / len(ratios) if ratios else 1.0
+        # convergenza
+        if max(abs(v_new[i] - v[i]) for i in range(n)) < tol:
+            return v_new, lam
+        v = v_new
+    return v, lam
+
+def _ahp_weights_and_cr(matrix: List[List[float]]) -> Tuple[List[float], float]:
+    assert _is_square(matrix), "La matrice AHP deve essere quadrata."
+    n = len(matrix)
+    w, lam_max = _power_method(matrix)
+    ci = (lam_max - n) / (n - 1) if n > 1 else 0.0
+    ri = _RI.get(n, 1.49)  # fallback per n>10
+    cr = (ci / ri) if ri > 0 else 0.0
+    return w, cr
+
+def _normalize_from_status(status: Optional[str], mapping: Dict[str, float]) -> Optional[float]:
+    if status is None:
+        return None
+    return mapping.get(status, None)
+
+def _renormalize_weights(weights: List[float], mask_keep: List[bool]) -> List[float]:
+    kept = [w for w, keep in zip(weights, mask_keep) if keep]
+    s = sum(kept)
+    if s <= 0 or not kept:
+        # se nessun indicatore valido → restituisci pesi uniformi (verranno poi esclusi a valle)
+        return [1.0 / max(1, sum(mask_keep))] * sum(mask_keep)
+    return [w / s for w in kept]
+
+class DssArgs(BaseModel):
+    # Output .current dei due report (chiave -> {"status": "🟢/🟡/🔴/INDEFINITO", "value": <num|None>, ...})
+    env_kpis: Dict[str, Dict[str, Any]] = Field(..., description="Output kpi_snapshot.current (per tutte le metriche ambientali).")
+    social_kpis: Dict[str, Dict[str, Any]] = Field(..., description="Output social_kpi_snapshot.current (per tutte le metriche sociali).")
+
+    # Matrici AHP opzionali (se assenti → default)
+    category_matrix: Optional[List[List[float]]] = Field(
+        None,
+        description="Matrice A 3x3 per categorie [Ambientale, Sociale, Economico]. Se None usa il default DSS."
+    )
+    env_matrix: Optional[List[List[float]]] = Field(
+        None,
+        description="Matrice B (ambientale) NxN sugli indicatori inclusi. Se None, pesi uniformi."
+    )
+    social_matrix: Optional[List[List[float]]] = Field(
+        None,
+        description="Matrice B (sociale) MxM sugli indicatori inclusi. Se None, pesi uniformi."
+    )
+
+    # Parametri normalizzazione & economic placeholder
+    status_mapping: Optional[Dict[str, float]] = Field(
+        default={"🟢": 1.0, "🟡": 0.6, "🔴": 0.2},
+        description="Mappatura stato→[0,1]. INDEFINITO è escluso."
+    )
+    economic_value: float = Field(
+        0.5, ge=0.0, le=1.0,
+        description="Valore normalizzato della categoria Economico (placeholder neutro)."
+    )
+
+def dss_compute(**payload) -> Dict[str, Any]:
+    """
+    Unico tool DSS: combina KPI Ambientali e Sociali (già calcolati) con AHP e produce score e ranking.
+    - Default matrici:
+        A (categorie) = [[1,3,2],[1/3,1,1/2],[1/2,2,1]]
+        B_env, B_soc  = uniformi (se non fornite)
+    - Normalizzazione: da status (🟢=1, 🟡=0.6, 🔴=0.2; INDEFINITO escluso).
+    - Economico: valore fisso 0.5 (neutro) finché non sarà disponibile un set di KPI economici.
+    """
+    args = DssArgs(**payload)
+    status_map = args.status_mapping or {"🟢":1.0, "🟡":0.6, "🔴":0.2}
+
+    # 1) Prepara liste ordinate di indicatori e valori normalizzati
+    env_names = []
+    env_vals  = []
+    for k, v in args.env_kpis.items():
+        s = v.get("status")
+        n = _normalize_from_status(s, status_map)
+        if n is not None:
+            env_names.append(k)
+            env_vals.append(n)
+    soc_names = []
+    soc_vals  = []
+    for k, v in args.social_kpis.items():
+        s = v.get("status")
+        n = _normalize_from_status(s, status_map)
+        if n is not None:
+            soc_names.append(k)
+            soc_vals.append(n)
+
+    # 2) AHP — pesi categorie
+    cat_A = args.category_matrix or [
+        [1,   3,   2],
+        [1/3, 1,   1/2],
+        [1/2, 2,   1],
+    ]
+    if not _is_square(cat_A) or len(cat_A) != 3:
+        return {"error": "category_matrix deve essere 3x3 (Ambientale, Sociale, Economico)."}
+    cat_w, cat_cr = _ahp_weights_and_cr(cat_A)
+    # Indici: 0=Amb, 1=Soc, 2=Eco
+    w_amb, w_soc, w_eco = cat_w
+
+    # 3) AHP — pesi interni (ambientale/sociale)
+    #    Se non fornite matrici B, usa pesi uniformi sugli indicatori validi.
+    if env_names:
+        if args.env_matrix and _is_square(args.env_matrix) and len(args.env_matrix) == len(env_names):
+            w_env, cr_env = _ahp_weights_and_cr(args.env_matrix)
+        else:
+            w_env = [1.0/len(env_names)] * len(env_names)
+            cr_env = 0.0
+    else:
+        w_env, cr_env = [], 0.0
+
+    if soc_names:
+        if args.social_matrix and _is_square(args.social_matrix) and len(args.social_matrix) == len(soc_names):
+            w_soc_i, cr_soc = _ahp_weights_and_cr(args.social_matrix)
+        else:
+            w_soc_i = [1.0/len(soc_names)] * len(soc_names)
+            cr_soc = 0.0
+    else:
+        w_soc_i, cr_soc = [], 0.0
+
+    # 4) Rinormalizza pesi interni sul solo sottoinsieme di indicatori DEFINITI (già filtrati sopra).
+    # (Qui già consideriamo solo indicatori con valore definito, quindi i pesi sono coerenti.)
+
+    # 5) Pesi finali per ogni indicatore
+    final_items = []  # (nome, categoria, peso_finale, valore_norm, contributo, gap)
+    # Ambientale
+    for name, w_i, val in zip(env_names, w_env, env_vals):
+        wf = w_amb * w_i
+        contrib = wf * val
+        gap = wf * (1.0 - val)
+        final_items.append({"name": name, "category": "environment",
+                            "final_weight": wf, "norm_value": val,
+                            "contribution": contrib, "gap": gap})
+    # Sociale
+    for name, w_i, val in zip(soc_names, w_soc_i, soc_vals):
+        wf = w_soc * w_i
+        contrib = wf * val
+        gap = wf * (1.0 - val)
+        final_items.append({"name": name, "category": "social",
+                            "final_weight": wf, "norm_value": val,
+                            "contribution": contrib, "gap": gap})
+    # Economico placeholder (unico indicatore, valore neutro 0.5)
+    econ_contrib = w_eco * args.economic_value
+    final_items.append({"name": "economic_placeholder", "category": "economic",
+                        "final_weight": w_eco, "norm_value": args.economic_value,
+                        "contribution": econ_contrib, "gap": w_eco * (1.0 - args.economic_value)})
+
+    # 6) Score complessivo e ranking priorità (gap desc)
+    overall_score = sum(item["contribution"] for item in final_items if isfinite(item["contribution"]))
+    # Ranking priorità: maggiore gap ⇒ maggiore priorità d’intervento
+    priority = sorted(final_items, key=lambda x: x["gap"], reverse=True)
+
+    # 7) Output
+    out = {
+        "ahp": {
+            "category_weights": {"environment": w_amb, "social": w_soc, "economic": w_eco},
+            "category_CR": cat_cr,
+            "internal": {
+                "environment": {"weights": dict(zip(env_names, w_env)), "CR": cr_env},
+                "social": {"weights": dict(zip(soc_names, w_soc_i)), "CR": cr_soc},
+            },
+            "consistency_note": "CR < 0.1 raccomandato; se superiore, rivedere i confronti."
+        },
+        "normalized_values": {
+            "environment": dict(zip(env_names, env_vals)),
+            "social": dict(zip(soc_names, soc_vals)),
+            "economic": {"economic_placeholder": args.economic_value}
+        },
+        "final_items": final_items,  # elenco con pesi finali, contributi e gap
+        "overall_score": overall_score,  # [0..1]
+        "overall_score_pct": round(overall_score * 100, 2),  # %
+        "priority_ranking": [item["name"] for item in priority],
+        "notes": [
+            "Normalizzazione da stato: 🟢=1.0, 🟡=0.6, 🔴=0.2; INDEFINITO escluso.",
+            "Pesi interni uniformi se non fornite matrici B; economico placeholder=0.5 neutro.",
+            "Indicatori non definiti esclusi e pesi interni rinormalizzati sul sottoinsieme disponibile."
+        ]
+    }
+    return out
+
+dss_compute_tool = StructuredTool.from_function(
+    func=dss_compute,
+    name="dss_compute",
+    description="Calcola il DSS (AHP) combinando KPI Ambientali e Sociali già calcolati. Opzionale: matrici AHP e mapping stato→[0,1]. Economico neutro (0.5).",
+    args_schema=DssArgs,
+)
+########################################################################################################################
+
+
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ESPORTA tool list
 # ─────────────────────────────────────────────────────────────────────────────
 TOOLS = [
     # Ambientale
-    read_data_by_time_tool,
-    read_last_n_tool,
-    kpi_snapshot_tool,
+    env_kpi_snapshot_tool,
     # Sociale
-    social_requirements_tool,
-    upsert_social_kpis_tool,
-    read_social_kpis_tool,
     social_kpi_snapshot_tool,
-    read_kpi_targets_tool
+    read_kpi_targets_tool,
+    # DSS
+    dss_compute_tool
 ]
+#

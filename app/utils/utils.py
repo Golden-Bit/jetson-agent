@@ -41,14 +41,9 @@ from .system_message import (
 
 # Import dei tool (uno per modalità)
 from .tools import (
-    env_kpi_snapshot_tool,
-    social_kpi_snapshot_tool,
-    dss_compute_tool,
-    read_social_kpis_tool,
-    read_kpi_targets_tool,
-    read_data_by_time_tool
+    generate_dss_report, read_kpi_data, read_social_data,read_env_data, generate_environment_report, generate_social_report, get_kpi_targets
 )
-from .tools_ import read_last_n_tool
+
 
 # --------------------------------------------------------------------------
 # ENV / fallback per Ollama OpenAI-compat (nessuna vera API key richiesta)
@@ -56,7 +51,7 @@ from .tools_ import read_last_n_tool
 os.environ.setdefault("OPENAI_BASE_URL", "http://localhost:11434/v1")
 os.environ.setdefault("OPENAI_API_KEY", "ollama")  # dummy key
 
-MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:30b")
+MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b-instruct-fp16") #"llama3.1:8b-instruct-q4_K_M" #"llama3.3:70b-instruct-q4_K_M" #"qwen3:30b"
 TEMPERATURE = float(os.environ.get("AGENT_TEMPERATURE", "0.2"))
 HIDE_THINK = os.environ.get("HIDE_THINK", "true").lower() in ("1", "true", "yes")
 
@@ -79,17 +74,17 @@ Mode = Literal["env", "social", "dss"]
 _MODE_CONFIG = {
     "env": {
         "system_message": AGENT_ENV_SYSTEM_MESSAGE,
-        "tools": [env_kpi_snapshot_tool, read_last_n_tool, read_data_by_time_tool], #, read_kpi_targets_tool],
+        "tools": [read_env_data, generate_environment_report, get_kpi_targets],
         "run_name": "ENV-Agent",
     },
     "social": {
         "system_message": AGENT_SOC_SYSTEM_MESSAGE,
-        "tools": [social_kpi_snapshot_tool, read_social_kpis_tool], #, read_kpi_targets_tool],
+        "tools": [read_social_data, generate_social_report, get_kpi_targets],
         "run_name": "SOC-Agent",
     },
     "dss": {
         "system_message": AGENT_DSS_SYSTEM_MESSAGE,
-        "tools": [dss_compute_tool],
+        "tools": [generate_dss_report, get_kpi_targets],  # da riempire in seguito
         "run_name": "DSS-Agent",
     },
 }

@@ -1,32 +1,46 @@
 # -*- coding: utf-8 -*-
 """
-Structured Tools:
-- Ambientale: lettura storico (periodo / ultime N), KPI snapshot/trend usando target da JSON.
-- Sociale: raccolta e lettura KPI, snapshot/trend/score usando target da JSON.
-- I file di target sono esterni e modificabili senza cambiare codice (auto-bootstrap con default).
+Structured Tools per agente ESG (monitoraggio e reportistica).
 
-Percorsi configurabili via ENV (default tra parentesi):
-- SENSOR_DATA_PATH  (./data/sensor_timeseries.json)
-- SOCIAL_DATA_PATH  (./data/social_kpis.json)
-- KPI_TARGETS_PATH  (./data/kpi_targets.json)
+Contenuto:
+- Lettura dataset ambientale/sociale con filtro per indici o date.
+- Generazione report Ambientale (markdown o JSON).
+- Generazione report Sociale (markdown o JSON).
+- Lettura targets da file esterno (bootstrap automatico se mancante).
+
+ENV richieste & default:
+- SENSOR_DATA_PATH  (default: ./data/dati_sensori.json)
+- SOCIAL_DATA_PATH  (default: ./data/social_kpis.json)
+- KPI_TARGETS_PATH  (default: ./data/kpi_targets.json)
+
+NOTE OPERATIVE:
+- Gli indici si riferiscono SEMPRE alla vista **decrescente** (più recente = indice 0).
+- Se l’intervallo richiesto eccede i dati disponibili, si ritorna il massimo ottenibile (nessun errore).
+- Le valutazioni (🟢/🟡/🔴) usano i targets del file; in assenza di target/campo → status "⚪" (N/D).
 """
 
+from __future__ import annotations
 import os
 import json
-import datetime
-from typing import List, Dict, Any, Optional, Tuple
+import math
+import statistics
+from typing import List, Dict, Any, Optional, Tuple, Literal
+from datetime import datetime, date
 from pydantic import BaseModel, Field, validator
 from langchain_core.tools import StructuredTool
 
+from .dss_utils import _status_to_norm01, FIN_KPI_ORDER, _ahp_weights_and_cr, ENV_KPI_FOR_DSS, \
+    _pairwise_equal_matrix, _has_thresholds
+
 # ─────────────────────────────────────────────────────────────────────────────
-# PATH
+# PATH (puoi sovrascrivere via ENV)
 # ─────────────────────────────────────────────────────────────────────────────
 SENSOR_DATA_PATH = os.environ.get("SENSOR_DATA_PATH", "C:\\Users\\info\\Desktop\\work_space\\repositories\\jetson-agent\\app\\data\\dati_sensori.json")
 SOCIAL_DATA_PATH = os.environ.get("SOCIAL_DATA_PATH", "C:\\Users\\info\\Desktop\\work_space\\repositories\\jetson-agent\\app\\data\\social_kpis.json")
 KPI_TARGETS_PATH = os.environ.get("KPI_TARGETS_PATH", "C:\\Users\\info\\Desktop\\work_space\\repositories\\jetson-agent\\app\\data\\kpi_targets.json")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DEFAULT TARGETS (usati per bootstrap se il file non esiste)
+# DEFAULT TARGETS (bootstrap se file mancante)
 # ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_TARGETS: Dict[str, Any] = {
     "environment": {
@@ -36,7 +50,8 @@ _DEFAULT_TARGETS: Dict[str, Any] = {
         "distance_mm":   {"target": 120, "tol": 5, "yellow_extra": 5, "unit": "mm"},
         "vibration_g":   {"green": [0.2, 1.0], "yellow": [[0.0, 0.2], [1.0, 1.5]], "limits": [0, 99], "unit": "g"},
         "co2_ppm":       {"green": [0, 700], "yellow": [[700, 1000]], "limits": [0, 100000], "unit": "ppm"},
-        "energy_specific": {"unit": "kWh/kg"},   # target opzionali → possono essere aggiunti
+        # opzionali (per riepilogo footprint, se disponibili a valle):
+        "energy_specific": {"unit": "kWh/kg"},
         "water_specific":  {"unit": "L/kg"},
         "co2eq_ratio":     {"unit": "%"},
         "trend_epsilon": 0.1,
@@ -58,6 +73,24 @@ _DEFAULT_TARGETS: Dict[str, Any] = {
     }
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Wrapper per adattare funzioni "fn(args: Model)" a StructuredTool con kwargs
+# ─────────────────────────────────────────────────────────────────────────────
+def _wrap_args(model_cls, impl_fn):
+    """
+    Converte kwargs (o un dict sotto la chiave 'args') nel Pydantic model richiesto
+    dalla funzione implementativa, poi invoca impl_fn(args_model).
+    """
+    def _inner(**kwargs):
+        payload = kwargs.get("args", kwargs)  # supporta sia {...} che {"args": {...}}
+        args_obj = model_cls(**(payload or {}))
+        return impl_fn(args_obj)
+    return _inner
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Utility: file targets
+# ─────────────────────────────────────────────────────────────────────────────
 def _ensure_targets_file():
     os.makedirs(os.path.dirname(KPI_TARGETS_PATH) or ".", exist_ok=True)
     if not os.path.exists(KPI_TARGETS_PATH):
@@ -70,210 +103,20 @@ def _load_targets() -> Dict[str, Any]:
         return json.load(f)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HELPERS COMUNI
+# Utility: caricamento dataset
 # ─────────────────────────────────────────────────────────────────────────────
-def _parse_ts(ts: str) -> datetime.datetime:
-    return datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
-
-def _trend(vals: List[float], eps: float) -> str:
-    seq = [v for v in vals if isinstance(v, (int, float))]
-    if len(seq) < 2:
-        return "→"
-    slope = seq[-1] - seq[0]
-    return "↗" if slope > eps else ("↘" if slope < -eps else "→")
-
-def _score_from_status(status: str) -> int:
-    if status == "🟢": return 10
-    if status == "🟡": return 7
-    if status == "🔴": return 3
-    return -1  # INDEFINITO → escluso
-
-def _final_score(statuses: List[str]) -> Optional[float]:
-    pts = [p for s in statuses if (p := _score_from_status(s)) >= 0]
-    if not pts:
-        return None
-    return sum(pts) / len(pts) * 10  # media (0–10) → 0–100
-
-def _filter_fields(rows: List[Dict[str, Any]], fields: Optional[List[str]]) -> List[Dict[str, Any]]:
-    if not fields:
-        return rows
-    keep = set(fields + ["timestamp"])
-    return [{k: v for k, v in r.items() if k in keep} for r in rows]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# AMBIENTALE
-# ─────────────────────────────────────────────────────────────────────────────
-def _load_sensor_rows() -> List[Dict[str, Any]]:
+def _load_env_rows() -> List[Dict[str, Any]]:
     if not os.path.exists(SENSOR_DATA_PATH):
-        raise FileNotFoundError(f"Dataset ambientale non trovato: {SENSOR_DATA_PATH}")
+        return []
     with open(SENSOR_DATA_PATH, "r", encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, list):
-        raise ValueError("Il dataset ambientale deve essere una lista JSON.")
+        return []
+    # ordina crescente per timestamp e poi ritorna lista
     data = [r for r in data if isinstance(r, dict) and "timestamp" in r]
     data.sort(key=lambda r: r["timestamp"])
     return data
 
-def _status_env(metric: str, value: Optional[float], tgt: Dict[str, Any]) -> str:
-    if value is None:
-        return "INDEFINITO"
-    # distance: target ± tol con fascia gialla extra
-    if metric == "distance_mm" and "target" in tgt:
-        center, tol = tgt["target"], tgt.get("tol", 0)
-        extra = tgt.get("yellow_extra", 0)
-        green = (center - tol, center + tol)
-        yellow = [(center - tol - extra, center - tol), (center + tol, center + tol + extra)]
-        if green[0] <= value <= green[1]:
-            return "🟢"
-        for lo, hi in yellow:
-            if lo <= value <= hi:
-                return "🟡"
-        return "🔴"
-    # generic with green range and optional yellow ranges
-    g = tgt.get("green")
-    y = tgt.get("yellow")
-    lim = tgt.get("limits")
-    if g and g[0] <= value <= g[1]:
-        return "🟢"
-    if y:
-        for r in (y if isinstance(y[0], list) else [y]):
-            if r[0] <= value <= r[1]:
-                return "🟡"
-    if lim and not (lim[0] <= value <= lim[1]):
-        return "🔴"
-    return "🔴"
-
-# Storico per periodo
-class ReadByTimeArgs(BaseModel):
-    start_ts: Optional[str] = Field(None, description="Timestamp ISO8601 inclusivo (es. 2025-09-15T23:34:10Z)")
-    end_ts: Optional[str] = Field(None, description="Timestamp ISO8601 inclusivo (es. 2025-09-15T23:39:59Z)")
-    fields: Optional[List[str]] = Field(None, description="Campi opzionali oltre a 'timestamp'.")
-
-def read_data_by_time(start_ts: Optional[str] = None,
-                      end_ts: Optional[str] = None,
-                      fields: Optional[List[str]] = None) -> Dict[str, Any]:
-    rows = _load_sensor_rows()
-    if start_ts:
-        t0 = _parse_ts(start_ts); rows = [r for r in rows if _parse_ts(r["timestamp"]) >= t0]
-    if end_ts:
-        t1 = _parse_ts(end_ts);   rows = [r for r in rows if _parse_ts(r["timestamp"]) <= t1]
-    out_rows = _filter_fields(rows, fields)
-    return {"source": SENSOR_DATA_PATH, "count": len(out_rows), "start_ts": start_ts, "end_ts": end_ts,
-            "fields": fields or "all", "records": out_rows}
-
-read_data_by_time_tool = StructuredTool.from_function(
-    func=read_data_by_time,
-    name="read_data_by_time",
-    description="(Ambientale) Legge lo storico filtrando per intervallo temporale (timestamp ISO8601).",
-    args_schema=ReadByTimeArgs,
-)
-
-# Ultime N
-class ReadLastNArgs(BaseModel):
-    n: int = Field(5, ge=1, le=1000, description="Quante misure più recenti restituire.")
-    fields: Optional[List[str]] = Field(None, description="Campi opzionali oltre a 'timestamp'.")
-
-def read_last_n(n: int = 5, fields: Optional[List[str]] = None) -> Dict[str, Any]:
-    rows = _load_sensor_rows()
-    out_rows = _filter_fields(rows[-n:], fields)
-    return {"source": SENSOR_DATA_PATH, "count": len(out_rows), "fields": fields or "all",
-            "records": out_rows,
-            "window": {"from": out_rows[0]["timestamp"] if out_rows else None,
-                       "to": out_rows[-1]["timestamp"] if out_rows else None}}
-
-read_last_n_tool = StructuredTool.from_function(
-    func=read_last_n,
-    name="read_last_n",
-    description="(Ambientale) Restituisce le ultime n misurazioni.",
-    args_schema=ReadLastNArgs,
-)
-
-# KPI snapshot ambientale (usa target da JSON)
-class KpiSnapshotArgs(BaseModel):
-    window_n: int = Field(None, ge=1, le=200, description="Se None usa trend_window_n dai target.")
-    co2_field: Optional[str] = Field(None, description="Nome campo CO2 ppm se disponibile (es. 'co2_ppm').")
-
-def kpi_snapshot(window_n: Optional[int] = None,
-                 co2_field: Optional[str] = None) -> Dict[str, Any]:
-    targets = _load_targets()["environment"]
-    eps = float(targets.get("trend_epsilon", 0.1))
-    win_n = int(window_n or targets.get("trend_window_n", 5))
-
-    rows = _load_sensor_rows()
-    if not rows:
-        return {"error": "Dataset ambientale vuoto", "source": SENSOR_DATA_PATH}
-
-    win = rows[-win_n:] if len(rows) >= win_n else rows[:]
-    last = win[-1]
-
-    def _series(key: str) -> List[float]:
-        return [r.get(key) for r in win if isinstance(r.get(key), (int, float))]
-
-    temp = last.get("temperature")
-    hum  = last.get("humidity")
-    lux  = last.get("light")
-    dist = last.get("distance_mm")
-    acc  = last.get("acceleration")
-    acc_g = None
-    if isinstance(acc, (int, float)):
-        acc_g = acc/9.806 if acc > 3 else acc
-
-    co2ppm = last.get(co2_field) if co2_field else None
-    air_raw = last.get("air_quality_raw")
-
-    # Status dinamico da targets
-    st_temp = _status_env("temperature", temp, targets["temperature"])
-    st_hum  = _status_env("humidity",    hum,  targets["humidity"])
-    st_lux  = _status_env("light",       lux,  targets["light"])
-    st_dist = _status_env("distance_mm", dist, targets["distance_mm"])
-    st_vib  = _status_env("vibration_g", acc_g, targets["vibration_g"]) if acc_g is not None else "INDEFINITO"
-
-    if co2ppm is not None:
-        st_co2 = _status_env("co2_ppm", co2ppm, targets["co2_ppm"])
-        co2_value, co2_unit = co2ppm, "ppm"
-    else:
-        st_co2 = "INDEFINITO"
-        co2_value, co2_unit = air_raw, "idx_raw"
-
-    statuses = [st_temp, st_hum, st_lux, st_dist, st_vib, st_co2]
-    score = _final_score(statuses)  # None ⇒ INDEFINITO
-    rating = None if score is None else ("🟢" if score >= 90 else ("🟡" if score >= 70 else "🔴"))
-
-    return {
-        "source": SENSOR_DATA_PATH,
-        "targets_used": targets,
-        "window": {"from": win[0]["timestamp"], "to": win[-1]["timestamp"], "used_last_n": len(win)},
-        "current": {
-            "temperature": {"value": temp, "unit": targets["temperature"].get("unit","°C"),
-                            "status": st_temp, "trend": _trend(_series("temperature"), eps)},
-            "humidity":    {"value": hum,  "unit": targets["humidity"].get("unit","%"),
-                            "status": st_hum,  "trend": _trend(_series("humidity"), eps)},
-            "light":       {"value": lux,  "unit": targets["light"].get("unit","lux"),
-                            "status": st_lux,  "trend": _trend(_series("light"), eps)},
-            "distance_mm": {"value": dist, "unit": targets["distance_mm"].get("unit","mm"),
-                            "status": st_dist, "trend": _trend(_series("distance_mm"), eps)},
-            "vibration":   {"value": acc_g,"unit": targets["vibration_g"].get("unit","g"),
-                            "status": st_vib,  "trend": _trend(_series("acceleration"), eps)},
-            "co2":         {"value": co2_value, "unit": co2_unit,
-                            "status": st_co2, "trend": _trend(_series(co2_field), eps) if co2_field else "→"},
-            # Altri KPI ambientali opzionali → lasciati a INDEFINITO lato report
-            "energy_specific": None,
-            "water_specific":  None,
-            "co2eq_ratio":     None,
-        },
-        "score": {"value": score, "rating": rating},
-    }
-
-env_kpi_snapshot_tool = StructuredTool.from_function(
-    func=kpi_snapshot,
-    name="env_kpi_snapshot",
-    description="(Ambientale) KPI correnti e trend su finestra (targets letti dal JSON esterno).",
-    args_schema=KpiSnapshotArgs,
-)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SOCIALE
-# ─────────────────────────────────────────────────────────────────────────────
 def _load_social_rows() -> List[Dict[str, Any]]:
     if not os.path.exists(SOCIAL_DATA_PATH):
         return []
@@ -281,511 +124,1387 @@ def _load_social_rows() -> List[Dict[str, Any]]:
         data = json.load(f)
     return data if isinstance(data, list) else []
 
-def _save_social_rows(rows: List[Dict[str, Any]]) -> None:
-    os.makedirs(os.path.dirname(SOCIAL_DATA_PATH) or ".", exist_ok=True)
-    with open(SOCIAL_DATA_PATH, "w", encoding="utf-8") as f:
-        json.dump(rows, f, ensure_ascii=False, indent=2)
-
-# Elenco campi richiesti
-class SocialRequirementsArgs(BaseModel):
-    pass
-
-def social_requirements() -> Dict[str, Any]:
-    return {
-        "required_fields": [
-            "facility", "period_start", "period_end",
-            "turnover_pct", "training_hours_per_employee_y", "satisfaction_index", "satisfaction_scale",
-            "absenteeism_pct", "gender_female_pct", "accidents_per_1000h",
-            "salary_vs_benchmark_pct", "ethical_suppliers_pct",
-            "overtime_hours_per_employee_m", "community_projects_count",
-        ],
-        "notes": "Fornisci numeri; se mancano resteranno INDEFINITI nel report (esclusi dallo score).",
-    }
-
-social_requirements_tool = StructuredTool.from_function(
-    func=social_requirements,
-    name="social_requirements",
-    description="(Sociale) Elenco dei campi da chiedere all'utente prima del report sociale.",
-    args_schema=SocialRequirementsArgs,
-)
-
-# Upsert KPI sociali
-class SocialUpsertArgs(BaseModel):
-    facility: str = Field(..., description="Nome stabilimento")
-    period_start: str = Field(..., description="Inizio periodo ISO8601 (es. 2025-01-01)")
-    period_end: str = Field(..., description="Fine periodo ISO8601 (es. 2025-03-31)")
-    turnover_pct: Optional[float] = None
-    training_hours_per_employee_y: Optional[float] = None
-    satisfaction_index: Optional[float] = None
-    satisfaction_scale: Optional[int] = Field(100, description="Scala indice soddisfazione: 100 (default) o 10")
-    absenteeism_pct: Optional[float] = None
-    gender_female_pct: Optional[float] = None
-    accidents_per_1000h: Optional[float] = None
-    salary_vs_benchmark_pct: Optional[float] = None
-    ethical_suppliers_pct: Optional[float] = None
-    overtime_hours_per_employee_m: Optional[float] = None
-    community_projects_count: Optional[int] = None
-
-    @validator("satisfaction_scale")
-    def _check_scale(cls, v):
-        if v not in (10, 100):
-            raise ValueError("satisfaction_scale deve essere 10 o 100")
-        return v
-
-def upsert_social_kpis(**payload) -> Dict[str, Any]:
-    rows = _load_social_rows()
-    payload["saved_at"] = datetime.datetime.utcnow().isoformat() + "Z"
-    rows = [r for r in rows if not (
-        r.get("facility") == payload["facility"]
-        and r.get("period_start") == payload["period_start"]
-        and r.get("period_end") == payload["period_end"]
-    )]
-    rows.append(payload)
-    _save_social_rows(rows)
-    return {"stored": True, "path": SOCIAL_DATA_PATH, "count": len(rows), "last": payload}
-
-upsert_social_kpis_tool = StructuredTool.from_function(
-    func=upsert_social_kpis,
-    name="upsert_social_kpis",
-    description="(Sociale) Registra/aggiorna KPI per periodo e stabilimento.",
-    args_schema=SocialUpsertArgs,
-)
-
-# Lettura KPI sociali
-class ReadSocialArgs(BaseModel):
-    facility: Optional[str] = None
-    period_start: Optional[str] = None
-    period_end: Optional[str] = None
-    latest: bool = Field(True, description="Se True e non fornisci periodo, restituisce l'ultimo record per facility.")
-
-def read_social_kpis(facility: Optional[str] = None,
-                     period_start: Optional[str] = None,
-                     period_end: Optional[str] = None,
-                     latest: bool = True) -> Dict[str, Any]:
-    rows = _load_social_rows()
-    if facility:
-        rows = [r for r in rows if r.get("facility") == facility]
-    if period_start:
-        rows = [r for r in rows if r.get("period_start") == period_start]
-    if period_end:
-        rows = [r for r in rows if r.get("period_end") == period_end]
-    rows.sort(key=lambda r: r.get("saved_at", ""), reverse=True)
-    if latest and rows:
-        rows = [rows[0]]
-    return {"source": SOCIAL_DATA_PATH, "count": len(rows), "records": rows}
-
-read_social_kpis_tool = StructuredTool.from_function(
-    func=read_social_kpis,
-    name="read_social_kpis",
-    description="(Sociale) Legge KPI sociali salvati (per periodo/facility o ultimo disponibile).",
-    args_schema=ReadSocialArgs,
-)
-
-# Snapshot/score/trend sociale (usa target da JSON)
-class SocialSnapshotArgs(BaseModel):
-    facility: Optional[str] = None
-    window_n: int = Field(None, ge=1, le=48, description="Se None usa trend_window_n dai target.")
-
-def _status_social(metric: str, v: Optional[float], tgt: Dict[str, Any], scale: Optional[int] = None) -> str:
-    if v is None:
-        return "INDEFINITO"
-    # normalizza eventuale scala 0–10 su 0–100 per il confronto con target
-    if metric == "satisfaction_index" and scale == 10:
-        v = v * 10
-    # center (intervallo verde in mezzo)
-    if tgt.get("direction") == "center":
-        g = tgt.get("green"); y = tgt.get("yellow")
-        if g and g[0] <= v <= g[1]: return "🟢"
-        for r in (y if isinstance(y[0], list) else [y]):
-            if r and r[0] <= v <= r[1]: return "🟡"
-        return "🔴"
-    # higher_better
-    if tgt.get("direction") in ("higher", "higher_integer"):
-        g = tgt.get("green"); y = tgt.get("yellow")
-        if g and v >= g[0]: return "🟢"
-        if y:
-            for r in (y if isinstance(y[0], list) else [y]):
-                if r and r[0] <= v <= r[1]: return "🟡"
-        return "🔴"
-    # lower_better
-    if tgt.get("direction") == "lower":
-        g = tgt.get("green"); y = tgt.get("yellow")
-        if g and v <= g[1]: return "🟢"
-        if y:
-            for r in (y if isinstance(y[0], list) else [y]):
-                if r and r[0] <= v <= r[1]: return "🟡"
-        return "🔴"
-    return "INDEFINITO"
-
-def social_kpi_snapshot(facility: Optional[str] = None, window_n: Optional[int] = None) -> Dict[str, Any]:
-    targets_all = _load_targets()["social"]
-    eps = float(targets_all.get("trend_epsilon", 0.1))
-    win_n = int(window_n or targets_all.get("trend_window_n", 3))
-
-    rows = _load_social_rows()
-    if facility:
-        rows = [r for r in rows if r.get("facility") == facility]
-    rows.sort(key=lambda r: r.get("saved_at", ""), reverse=True)
-    if not rows:
-        return {"error": "Nessun dato sociale disponibile", "source": SOCIAL_DATA_PATH}
-
-    win = rows[:win_n]
-    current = win[0]
-    scale = current.get("satisfaction_scale", 100)
-
-    metrics = [
-        "turnover_pct",
-        "training_hours_per_employee_y",
-        "satisfaction_index",
-        "absenteeism_pct",
-        "gender_female_pct",
-        "accidents_per_1000h",
-        "salary_vs_benchmark_pct",
-        "ethical_suppliers_pct",
-        "overtime_hours_per_employee_m",
-        "community_projects_count",
-    ]
-
-    def series(key: str) -> List[float]:
-        out = []
-        for r in reversed(win):
-            v = r.get(key)
-            if isinstance(v, (int, float)):
-                out.append(v * 10 if (key == "satisfaction_index" and r.get("satisfaction_scale", 100) == 10) else v)
-        return out
-
-    current_out: Dict[str, Any] = {}
-    statuses: List[str] = []
-    missing: List[str] = []
-
-    for m in metrics:
-        val = current.get(m)
-        tgt = targets_all.get(m, {})
-        status = _status_social(m, val, tgt, scale)
-        trend = _trend(series(m), eps)
-        if val is None:
-            missing.append(m)
-        current_out[m] = {"value": val, "status": status, "trend": trend}
-        statuses.append(status)
-
-    score = _final_score(statuses)  # None ⇒ INDEFINITO
-    rating = None if score is None else ("🟢" if score >= 90 else ("🟡" if score >= 70 else "🔴"))
-
-    return {
-        "source": SOCIAL_DATA_PATH,
-        "targets_used": targets_all,
-        "facility": current.get("facility"),
-        "period": {"start": current.get("period_start"), "end": current.get("period_end")},
-        "window_used": len(win),
-        "current": current_out,
-        "score": {"value": score, "rating": rating},
-        "missing_fields": missing,
-    }
-
-social_kpi_snapshot_tool = StructuredTool.from_function(
-    func=social_kpi_snapshot,
-    name="social_kpi_snapshot",
-    description="(Sociale) Stato/trend KPI sociali con punteggio esclusivo dei soli KPI definiti (targets da JSON).",
-    args_schema=SocialSnapshotArgs,
-)
-
-# --- subito dopo gli altri import/args ---
-class ReadKpiTargetsArgs(BaseModel):
-    section: Optional[str] = Field(
-        None,
-        description="Seleziona una sezione del JSON: 'environment' oppure 'social'. Se None, restituisce tutto."
-    )
-    metrics: Optional[List[str]] = Field(
-        None,
-        description="Facoltativo: elenco di metriche da filtrare (es. ['temperature','humidity']). Valido solo se section è impostata."
-    )
-
-def read_kpi_targets(section: Optional[str] = None,
-                     metrics: Optional[List[str]] = None) -> Dict[str, Any]:
-    """
-    Legge i target KPI dal file JSON esterno (auto-bootstrap con default se mancante).
-    Opzioni:
-      - section: 'environment' | 'social' | None (tutto)
-      - metrics: lista di metriche da filtrare (valida solo se section è specificata)
-    """
+# ─────────────────────────────────────────────────────────────────────────────
+# Utility: date/filtri/formatting
+# ─────────────────────────────────────────────────────────────────────────────
+def _parse_dt(s: str) -> datetime:
+    # accetta ISO pieno, 'YYYY-MM-DD' o 'YYYY-MM'
     try:
-        data = _load_targets()  # garantisce bootstrap su file assente
-    except json.JSONDecodeError as e:
-        return {"error": f"File target non valido: {e}", "source": KPI_TARGETS_PATH}
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        pass
+    try:
+        return datetime.strptime(s, "%Y-%m-%d")
+    except Exception:
+        pass
+    return datetime.strptime(s, "%Y-%m")
 
-    out: Dict[str, Any] = {"source": KPI_TARGETS_PATH}
+def _fmt_num(v: Any, decimals: int = 1) -> str:
+    if v is None:
+        return "N/D"
+    if isinstance(v, (int,)) or (isinstance(v, float) and float(v).is_integer()):
+        return f"{int(v)}"
+    try:
+        return f"{float(v):.{decimals}f}"
+    except Exception:
+        return str(v)
 
-    # Nessun filtro → ritorna tutto
-    if section is None:
-        out["targets"] = data
-        return out
+def _range_contains(value: float, rng: List[float]) -> bool:
+    return value >= float(rng[0]) and value <= float(rng[1])
 
-    # Sezione specifica
-    if section not in data:
-        return {"error": f"Sezione '{section}' non trovata nei target.", "available": list(data.keys()),
-                "source": KPI_TARGETS_PATH}
-
-    section_dict = data[section]
-
-    # Se non richiedo filtri metriche → ritorna intera sezione
-    if not metrics:
-        out["targets"] = {section: section_dict}
-        return out
-
-    # Filtra per metriche richieste
-    filtered = {m: section_dict[m] for m in metrics if m in section_dict}
-    missing = [m for m in metrics if m not in section_dict]
-
-    out["targets"] = {section: filtered}
-    if missing:
-        out["missing_metrics"] = missing
-        out["available_metrics"] = sorted(section_dict.keys())
-    return out
-
-read_kpi_targets_tool = StructuredTool.from_function(
-    func=read_kpi_targets,
-    name="read_kpi_targets",
-    description="Legge i target KPI dal JSON esterno (auto-bootstrap). Opzionale filtro per sezione ('environment'|'social') e metriche.",
-    args_schema=ReadKpiTargetsArgs,
-)
-
-
-
-
-
-
-
-########################################################################################################################
-# ─────────────────────────────────────────────────────────────────────────────
-# DSS (AHP) — unico tool che combina Ambientale + Sociale (+Economico neutro)
-# ─────────────────────────────────────────────────────────────────────────────
-from math import isfinite
-
-# Random Index (Saaty) per la Consistency Ratio
-_RI = {1: 0.00, 2: 0.00, 3: 0.58, 4: 0.90, 5: 1.12, 6: 1.24, 7: 1.32, 8: 1.41, 9: 1.45, 10: 1.49}
-
-def _is_square(m: List[List[float]]) -> bool:
-    return isinstance(m, list) and len(m) > 0 and all(isinstance(r, list) and len(r) == len(m) for r in m)
-
-def _power_method(matrix: List[List[float]], iters: int = 100, tol: float = 1e-9) -> Tuple[List[float], float]:
-    """Calcola l'autovettore principale (normalizzato) e lambda_max con met. delle potenze (senza numpy)."""
-    n = len(matrix)
-    v = [1.0 / n] * n
-    for _ in range(iters):
-        # w = M @ v
-        w = [sum(matrix[i][j] * v[j] for j in range(n)) for i in range(n)]
-        s = sum(w)
-        if s == 0:
-            # matrice degenerata → uniform
-            return [1.0 / n] * n, 1.0
-        v_new = [x / s for x in w]
-        # stima lambda_max (Rayleigh) come media dei rapporti (M v)_i / v_i
-        ratios = []
-        for i in range(n):
-            if v_new[i] > 0:
-                mv_i = sum(matrix[i][j] * v_new[j] for j in range(n))
-                ratios.append(mv_i / v_new[i])
-        lam = sum(ratios) / len(ratios) if ratios else 1.0
-        # convergenza
-        if max(abs(v_new[i] - v[i]) for i in range(n)) < tol:
-            return v_new, lam
-        v = v_new
-    return v, lam
-
-def _ahp_weights_and_cr(matrix: List[List[float]]) -> Tuple[List[float], float]:
-    assert _is_square(matrix), "La matrice AHP deve essere quadrata."
-    n = len(matrix)
-    w, lam_max = _power_method(matrix)
-    ci = (lam_max - n) / (n - 1) if n > 1 else 0.0
-    ri = _RI.get(n, 1.49)  # fallback per n>10
-    cr = (ci / ri) if ri > 0 else 0.0
-    return w, cr
-
-def _normalize_from_status(status: Optional[str], mapping: Dict[str, float]) -> Optional[float]:
-    if status is None:
-        return None
-    return mapping.get(status, None)
-
-def _renormalize_weights(weights: List[float], mask_keep: List[bool]) -> List[float]:
-    kept = [w for w, keep in zip(weights, mask_keep) if keep]
-    s = sum(kept)
-    if s <= 0 or not kept:
-        # se nessun indicatore valido → restituisci pesi uniformi (verranno poi esclusi a valle)
-        return [1.0 / max(1, sum(mask_keep))] * sum(mask_keep)
-    return [w / s for w in kept]
-
-class DssArgs(BaseModel):
-    # Output .current dei due report (chiave -> {"status": "🟢/🟡/🔴/INDEFINITO", "value": <num|None>, ...})
-    env_kpis: Dict[str, Dict[str, Any]] = Field(..., description="Output kpi_snapshot.current (per tutte le metriche ambientali).")
-    social_kpis: Dict[str, Dict[str, Any]] = Field(..., description="Output social_kpi_snapshot.current (per tutte le metriche sociali).")
-
-    # Matrici AHP opzionali (se assenti → default)
-    category_matrix: Optional[List[List[float]]] = Field(
-        None,
-        description="Matrice A 3x3 per categorie [Ambientale, Sociale, Economico]. Se None usa il default DSS."
-    )
-    env_matrix: Optional[List[List[float]]] = Field(
-        None,
-        description="Matrice B (ambientale) NxN sugli indicatori inclusi. Se None, pesi uniformi."
-    )
-    social_matrix: Optional[List[List[float]]] = Field(
-        None,
-        description="Matrice B (sociale) MxM sugli indicatori inclusi. Se None, pesi uniformi."
-    )
-
-    # Parametri normalizzazione & economic placeholder
-    status_mapping: Optional[Dict[str, float]] = Field(
-        default={"🟢": 1.0, "🟡": 0.6, "🔴": 0.2},
-        description="Mappatura stato→[0,1]. INDEFINITO è escluso."
-    )
-    economic_value: float = Field(
-        0.5, ge=0.0, le=1.0,
-        description="Valore normalizzato della categoria Economico (placeholder neutro)."
-    )
-
-def dss_compute(**payload) -> Dict[str, Any]:
+def _status_from_targets(value: Optional[float], tdef: Dict[str, Any]) -> str:
     """
-    Unico tool DSS: combina KPI Ambientali e Sociali (già calcolati) con AHP e produce score e ranking.
-    - Default matrici:
-        A (categorie) = [[1,3,2],[1/3,1,1/2],[1/2,2,1]]
-        B_env, B_soc  = uniformi (se non fornite)
-    - Normalizzazione: da status (🟢=1, 🟡=0.6, 🔴=0.2; INDEFINITO escluso).
-    - Economico: valore fisso 0.5 (neutro) finché non sarà disponibile un set di KPI economici.
+    Ritorna 'green' | 'yellow' | 'red' | 'na'
+    Regole:
+    - Se esiste schema 'target±tol' → costruisce green/yellow.
+    - Se esistono 'green' (range) e 'yellow' (lista di range) → calcola in-range.
+    - Se value è None → 'na'
     """
-    args = DssArgs(**payload)
-    status_map = args.status_mapping or {"🟢":1.0, "🟡":0.6, "🔴":0.2}
+    if value is None:
+        return "na"
 
-    # 1) Prepara liste ordinate di indicatori e valori normalizzati
-    env_names = []
-    env_vals  = []
-    for k, v in args.env_kpis.items():
-        s = v.get("status")
-        n = _normalize_from_status(s, status_map)
-        if n is not None:
-            env_names.append(k)
-            env_vals.append(n)
-    soc_names = []
-    soc_vals  = []
-    for k, v in args.social_kpis.items():
-        s = v.get("status")
-        n = _normalize_from_status(s, status_map)
-        if n is not None:
-            soc_names.append(k)
-            soc_vals.append(n)
+    # target ± tol (caso distance_mm)
+    if "target" in tdef and "tol" in tdef:
+        tgt, tol = float(tdef["target"]), float(tdef["tol"])
+        yextra = float(tdef.get("yellow_extra", 0))
+        green = [tgt - tol, tgt + tol]
+        yellow = [[tgt - tol - yextra, tgt - tol], [tgt + tol, tgt + tol + yextra]]
+        if _range_contains(value, green):
+            return "green"
+        if any(_range_contains(value, r) for r in yellow):
+            return "yellow"
+        return "red"
 
-    # 2) AHP — pesi categorie
-    cat_A = args.category_matrix or [
-        [1,   3,   2],
-        [1/3, 1,   1/2],
-        [1/2, 2,   1],
-    ]
-    if not _is_square(cat_A) or len(cat_A) != 3:
-        return {"error": "category_matrix deve essere 3x3 (Ambientale, Sociale, Economico)."}
-    cat_w, cat_cr = _ahp_weights_and_cr(cat_A)
-    # Indici: 0=Amb, 1=Soc, 2=Eco
-    w_amb, w_soc, w_eco = cat_w
+    # range standard
+    green = tdef.get("green")
+    yellow = tdef.get("yellow", [])
+    if green and _range_contains(value, green):
+        return "green"
+    if any(_range_contains(value, r) for r in yellow):
+        return "yellow"
+    return "red"
 
-    # 3) AHP — pesi interni (ambientale/sociale)
-    #    Se non fornite matrici B, usa pesi uniformi sugli indicatori validi.
-    if env_names:
-        if args.env_matrix and _is_square(args.env_matrix) and len(args.env_matrix) == len(env_names):
-            w_env, cr_env = _ahp_weights_and_cr(args.env_matrix)
-        else:
-            w_env = [1.0/len(env_names)] * len(env_names)
-            cr_env = 0.0
-    else:
-        w_env, cr_env = [], 0.0
+def _status_emoji(s: str) -> str:
+    return {"green": "🟢", "yellow": "🟡", "red": "🔴", "na": "⚪"}.get(s, "⚪")
 
-    if soc_names:
-        if args.social_matrix and _is_square(args.social_matrix) and len(args.social_matrix) == len(soc_names):
-            w_soc_i, cr_soc = _ahp_weights_and_cr(args.social_matrix)
-        else:
-            w_soc_i = [1.0/len(soc_names)] * len(soc_names)
-            cr_soc = 0.0
-    else:
-        w_soc_i, cr_soc = [], 0.0
+def _trend_arrow(delta: Optional[float], eps: float = 0.1) -> str:
+    if delta is None:
+        return "—"
+    if delta > eps:
+        return "↗"
+    if delta < -eps:
+        return "↘"
+    return "→"
 
-    # 4) Rinormalizza pesi interni sul solo sottoinsieme di indicatori DEFINITI (già filtrati sopra).
-    # (Qui già consideriamo solo indicatori con valore definito, quindi i pesi sono coerenti.)
+def _score_from_status(s: str) -> int:
+    return {"green": 100, "yellow": 80, "red": 50}.get(s, 0)
 
-    # 5) Pesi finali per ogni indicatore
-    final_items = []  # (nome, categoria, peso_finale, valore_norm, contributo, gap)
-    # Ambientale
-    for name, w_i, val in zip(env_names, w_env, env_vals):
-        wf = w_amb * w_i
-        contrib = wf * val
-        gap = wf * (1.0 - val)
-        final_items.append({"name": name, "category": "environment",
-                            "final_weight": wf, "norm_value": val,
-                            "contribution": contrib, "gap": gap})
-    # Sociale
-    for name, w_i, val in zip(soc_names, w_soc_i, soc_vals):
-        wf = w_soc * w_i
-        contrib = wf * val
-        gap = wf * (1.0 - val)
-        final_items.append({"name": name, "category": "social",
-                            "final_weight": wf, "norm_value": val,
-                            "contribution": contrib, "gap": gap})
-    # Economico placeholder (unico indicatore, valore neutro 0.5)
-    econ_contrib = w_eco * args.economic_value
-    final_items.append({"name": "economic_placeholder", "category": "economic",
-                        "final_weight": w_eco, "norm_value": args.economic_value,
-                        "contribution": econ_contrib, "gap": w_eco * (1.0 - args.economic_value)})
+def _mk_target_str_env(k: str, t: Dict[str, Any]) -> str:
+    unit = t.get("unit", "")
+    if "target" in t and "tol" in t:
+        return f"{_fmt_num(t['target'], 0)}±{_fmt_num(t['tol'], 0)} {unit}".strip()
+    if "green" in t and isinstance(t["green"], list) and len(t["green"]) == 2:
+        return f"{_fmt_num(t['green'][0], 0)}–{_fmt_num(t['green'][1], 0)}{unit}".strip()
+    if unit:
+        return f"[{unit}]"
+    return "—"
 
-    # 6) Score complessivo e ranking priorità (gap desc)
-    overall_score = sum(item["contribution"] for item in final_items if isfinite(item["contribution"]))
-    # Ranking priorità: maggiore gap ⇒ maggiore priorità d’intervento
-    priority = sorted(final_items, key=lambda x: x["gap"], reverse=True)
+def _mk_target_str_soc(k: str, t: Dict[str, Any]) -> str:
+    """
+    Rende il target sociale in forma leggibile, usando i range 'green' e la 'direction':
+    - lower  → ≤ upper_green
+    - higher → ≥ lower_green
+    - center → lower_green–upper_green
+    - higher_integer → ≥ lower_green (intero) [+ unità]
+    Caso speciale: satisfaction_index (targets su scala 0–100) viene mostrato su /10.
+    """
+    if not t:
+        return "—"
 
-    # 7) Output
-    out = {
-        "ahp": {
-            "category_weights": {"environment": w_amb, "social": w_soc, "economic": w_eco},
-            "category_CR": cat_cr,
-            "internal": {
-                "environment": {"weights": dict(zip(env_names, w_env)), "CR": cr_env},
-                "social": {"weights": dict(zip(soc_names, w_soc_i)), "CR": cr_soc},
-            },
-            "consistency_note": "CR < 0.1 raccomandato; se superiore, rivedere i confronti."
-        },
-        "normalized_values": {
-            "environment": dict(zip(env_names, env_vals)),
-            "social": dict(zip(soc_names, soc_vals)),
-            "economic": {"economic_placeholder": args.economic_value}
-        },
-        "final_items": final_items,  # elenco con pesi finali, contributi e gap
-        "overall_score": overall_score,  # [0..1]
-        "overall_score_pct": round(overall_score * 100, 2),  # %
-        "priority_ranking": [item["name"] for item in priority],
-        "notes": [
-            "Normalizzazione da stato: 🟢=1.0, 🟡=0.6, 🔴=0.2; INDEFINITO escluso.",
-            "Pesi interni uniformi se non fornite matrici B; economico placeholder=0.5 neutro.",
-            "Indicatori non definiti esclusi e pesi interni rinormalizzati sul sottoinsieme disponibile."
-        ]
+    # unità per visualizzazione (senza placeholder)
+    unit_map = {
+        "turnover_pct": "%",
+        "training_hours_per_employee_y": "h/anno",
+        "satisfaction_index": "/10",
+        "absenteeism_pct": "%",
+        "gender_female_pct": "%",
+        "accidents_per_1000h": "",
+        "salary_vs_benchmark_pct": "%",
+        "ethical_suppliers_pct": "%",
+        "overtime_hours_per_employee_m": "h/mese",
+        "community_projects_count": "progetti",
     }
-    return out
+    unit = unit_map.get(k, "")
 
-dss_compute_tool = StructuredTool.from_function(
-    func=dss_compute,
-    name="dss_compute",
-    description="Calcola il DSS (AHP) combinando KPI Ambientali e Sociali già calcolati. Opzionale: matrici AHP e mapping stato→[0,1]. Economico neutro (0.5).",
-    args_schema=DssArgs,
-)
-########################################################################################################################
+    green = t.get("green")
+    direction = t.get("direction", "")
 
+    # Caso speciale: satisfaction_index (green su scala 0–100, display su /10)
+    if k == "satisfaction_index":
+        if isinstance(green, list) and len(green) == 2:
+            low = float(green[0])  # es. 80 → 8.0/10
+            try:
+                thr10 = low / 10.0
+                return f"≥ {_fmt_num(thr10, 1)}/10"
+            except Exception:
+                return "—"
+        return "—"
 
+    # Altri KPI sociali
+    if isinstance(green, list) and len(green) == 2:
+        lo, hi = float(green[0]), float(green[1])
+        if direction == "lower":
+            # es. absenteeism_pct green [0,3] → ≤ 3%
+            return f"≤ {_fmt_num(hi, 0)}{(' ' + unit) if unit and unit not in ['%', '/10'] else unit}"
+        elif direction == "higher":
+            # es. ethical_suppliers_pct green [80,100] → ≥ 80%
+            return f"≥ {_fmt_num(lo, 0)}{(' ' + unit) if unit and unit not in ['%', '/10'] else unit}"
+        elif direction == "center":
+            # es. gender_female_pct green [40,60] → 40–60%
+            sep = "–"
+            return f"{_fmt_num(lo, 0)}{unit if unit=='%' else (' ' + unit if unit else '')}{sep}{_fmt_num(hi, 0)}{unit if unit=='%' else (' ' + unit if unit else '')}"
+        elif direction == "higher_integer":
+            # es. community_projects_count green [2,1000] → ≥ 2 progetti
+            return f"≥ {int(math.ceil(lo))}{(' ' + unit) if unit else ''}"
 
+        # fallback: range pieno
+        sep = "–"
+        return f"{_fmt_num(lo, 0)}{unit if unit=='%' else (' ' + unit if unit else '')}{sep}{_fmt_num(hi, 0)}{unit if unit=='%' else (' ' + unit if unit else '')}"
+
+    # Nessuna info utile → unità o trattino
+    return unit or "—"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ESPORTA tool list
+# TOOL 1 — Lettura dati ENV/SOCIAL
 # ─────────────────────────────────────────────────────────────────────────────
-TOOLS = [
-    # Ambientale
-    env_kpi_snapshot_tool,
-    # Sociale
-    social_kpi_snapshot_tool,
-    read_kpi_targets_tool,
-    # DSS
-    dss_compute_tool
+
+class ReadKpiDataArgs(BaseModel):
+    """Input per lettura dati ENV/SOC con filtro per indici o date."""
+    kind: Literal["env", "social"] = Field(
+        default="env",
+        description="Sorgente dati.",
+        json_schema_extra={"example": "env"},
+    )
+    by: Literal["index", "date"] = Field(
+        default="index",
+        description="Modalità di selezione.",
+        json_schema_extra={"example": "index"},
+    )
+    idx_start: Optional[int] = Field(
+        default=0,
+        ge=0,
+        description="Indice di inizio (0 = più recente, solo by='index').",
+        json_schema_extra={"example": 0},
+    )
+    idx_end: Optional[int] = Field(
+        default=0,
+        ge=0,
+        description="Indice di fine incluso (solo by='index').",
+        json_schema_extra={"example": 49},
+    )
+    date_start: Optional[str] = Field(
+        default=None,
+        description="Data/DateTime inizio (solo by='date', ISO o YYYY-MM[-DD]).",
+        json_schema_extra={"example": "2025-04-01"},
+    )
+    date_end: Optional[str] = Field(
+        default=None,
+        description="Data/DateTime fine inclusiva (solo by='date').",
+        json_schema_extra={"example": "2025-06-30"},
+    )
+    facility: Optional[str] = Field(
+        default="",
+        description="Filtro stabilimento (solo SOCIAL).",
+        json_schema_extra={"example": "Stabilimento_Lino_B"},
+    )
+    #fields: Optional[List[str]] = Field(
+    #    default_factory=list,
+    #    description="Proiezione campi (vuoto = tutti).",
+    #    json_schema_extra={"example": ["timestamp", "temperature", "humidity"]},
+    #)
+    #order: Literal["desc", "asc"] = Field(
+    #    default="desc",
+    #    description="Ordinamento del risultato.",
+    #    json_schema_extra={"example": "desc"},
+    #)
+
+    class Config:
+        schema_extra = {
+            "examples": [
+                {"kind":"env","by":"index","idx_start":0,"idx_end":100},
+                {"kind":"social","by":"date","date_start":"2025-01-01","date_end":"2025-03-31","facility":"Stabilimento_Lino_B"},
+            ]
+        }
+
+
+def read_kpi_data_tool(args: ReadKpiDataArgs) -> Dict[str, Any]:
+    """
+    Descrizione:
+    Legge il dataset ambientale o sociale applicando un filtro per **indici** (0 = più recente)
+    oppure per **date**. Non genera errore se l'intervallo eccede i dati disponibili.
+
+    Output (dict):
+    {
+      "kind": "env" | "social",
+      "count": <int>,
+      "items": [ { ... }, ... ]   # ordinati secondo 'order'
+    }
+    """
+    kind = args.kind
+    fields = args.fields or []
+    order = args.order or "desc"
+
+    if kind == "env":
+        base = _load_env_rows()
+        # convertiamo 'acceleration' (m/s^2) in 'vibration_g' se presente
+        for r in base:
+            if "acceleration" in r and "vibration_g" not in r:
+                try:
+                    r["vibration_g"] = float(r["acceleration"]) / 9.81
+                except Exception:
+                    pass
+        key_dt = "timestamp"
+        # dataset ascendente per timestamp → per indici invertiamo
+    else:
+        base = _load_social_rows()
+        key_dt = "saved_at" if any("saved_at" in r for r in base) else "period_end"
+        # filtro facility se richiesto
+        if args.facility:
+            base = [r for r in base if r.get("facility") == args.facility]
+
+    if not base:
+        items: List[Dict[str, Any]] = []
+    else:
+        # vista discendente (più recente per primo)
+        desc = list(reversed(base))
+
+        if args.by == "index":
+            i0 = args.idx_start or 0
+            i1 = args.idx_end if args.idx_end is not None else i0
+            i0, i1 = max(0, i0), max(0, i1)
+            i0, i1 = min(i0, len(desc)-1), min(i1, len(desc)-1)
+            if i0 <= i1:
+                subset = desc[i0:i1+1]
+            else:
+                subset = desc[i1:i0+1]
+
+        else:  # by == date
+            d0 = _parse_dt(args.date_start) if args.date_start else datetime.min
+            d1 = _parse_dt(args.date_end) if args.date_end else datetime.max
+            subset = []
+            for r in desc:
+                try:
+                    rd = _parse_dt(str(r.get(key_dt)))
+                except Exception:
+                    continue
+                # inclusivo
+                if rd >= d0 and rd <= d1:
+                    subset.append(r)
+
+        items = subset if order == "desc" else list(reversed(subset))
+
+    # proiezione campi se richiesto
+    if fields:
+        items = [{k: v for k, v in r.items() if k in fields} for r in items]
+
+    return {"kind": kind, "count": len(items), "items": items}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KPI helpers (ambiente & sociale)
+# ─────────────────────────────────────────────────────────────────────────────
+def _avg(values: List[float]) -> Optional[float]:
+    vals = [float(v) for v in values if v is not None]
+    return (sum(vals) / len(vals)) if vals else None
+
+def _latest_value(rows: List[Dict[str, Any]], key: str) -> Optional[float]:
+    for r in rows:  # rows già discendenti
+        if key in r and r[key] is not None:
+            try:
+                return float(r[key])
+            except Exception:
+                return None
+    return None
+
+def _trend_delta(rows_desc: List[Dict[str, Any]], key: str, win: int) -> Optional[float]:
+    """
+    Calcola (current - mean(prev_win)).
+    Ritorna None se non ci sono abbastanza dati.
+    """
+    vals = []
+    for r in rows_desc:
+        if key in r and r[key] is not None:
+            try:
+                vals.append(float(r[key]))
+            except Exception:
+                vals.append(None)
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return None
+    cur = vals[0]
+    prev = vals[1:1+win]
+    if not prev:
+        return None
+    return cur - (sum(prev) / len(prev))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TOOL 2 — Report Ambientale
+# ─────────────────────────────────────────────────────────────────────────────
+ENV_KPI_ORDER = [
+    ("temperature", "Temperatura media ambiente"),
+    ("humidity", "Umidità relativa media"),
+    ("energy_specific", "Consumo energetico specifico"),
+    ("water_specific", "Consumo idrico specifico"),
+    ("vibration_g", "Livello vibrazioni macchine"),
+    ("light", "Luminosità ambientale"),
+    ("co2eq_ratio", "CO2eq.ris./CO2eq.tot"),
 ]
-#
+class EnvReportArgs(BaseModel):
+    """Input per generare il Report Ambientale (markdown o json)."""
+    by: Literal["index", "date"] = Field(
+        default="index",
+        description="Selezione dati.",
+        json_schema_extra={"example": "date"},
+    )
+    idx_start: Optional[int] = Field(
+        default=0,
+        ge=0,
+        description="Indice di inizio (solo by='index').",
+        json_schema_extra={"example": 0},
+    )
+    idx_end: Optional[int] = Field(
+        default=0,
+        ge=0,
+        description="Indice di fine incluso (solo by='index').",
+        json_schema_extra={"example": 1440},
+    )
+    date_start: Optional[str] = Field(
+        default=None,
+        description="Data/DateTime inizio (solo by='date').",
+        json_schema_extra={"example": "2025-09-01"},
+    )
+    date_end: Optional[str] = Field(
+        default=None,
+        description="Data/DateTime fine inclusiva (solo by='date').",
+        json_schema_extra={"example": "2025-09-10T23:59:59"},
+    )
+    output_mode: Literal["text", "json"] = Field(
+        default="text",
+        description="Formato report.",
+        json_schema_extra={"example": "json"},
+    )
+    facility: Optional[str] = Field(
+        default="",
+        description="Nome stabilimento mostrato in testata (non filtra ENV).",
+        json_schema_extra={"example": "Stabilimento_Lino_B"},
+    )
+    decimals: int = Field(
+        default=1,
+        ge=0,
+        le=6,
+        description="Decimali per resa testuale.",
+        json_schema_extra={"example": 1},
+    )
+
+    class Config:
+        schema_extra = {
+            "examples": [
+                {"by":"index","idx_start":0,"idx_end":500,"output_mode":"text"},
+                {"by":"date","date_start":"2025-09-01","date_end":"2025-09-07","output_mode":"json","facility":"Stabilimento_Lino_B"},
+            ]
+        }
+def generate_environment_report_tool(args: EnvReportArgs) -> Any:
+    """
+    Descrizione:
+    Genera il **Report di Sostenibilità Ambientale** nel formato del template.
+    Valuta ogni KPI contro i target e calcola lo score complessivo e le aree
+    di eccellenza/miglioramento. Supporta output 'text' (markdown) o 'json'.
+
+    Ritorna:
+    - Se output_mode='text' → stringa markdown.
+    - Se output_mode='json' → dict strutturato.
+    """
+    targets = _load_targets().get("environment", {})
+    trend_eps = float(targets.get("trend_epsilon", 0.1))
+    win_n = int(targets.get("trend_window_n", 5))
+
+    base = _load_env_rows()
+    desc = list(reversed(base))  # più recente → prima
+    # conversione vibrazioni
+    for r in desc:
+        if "acceleration" in r and "vibration_g" not in r:
+            try:
+                r["vibration_g"] = float(r["acceleration"]) / 9.81
+            except Exception:
+                pass
+
+    # selezione
+    if args.by == "index":
+        i0 = args.idx_start or 0
+        i1 = args.idx_end if args.idx_end is not None else i0
+        i0 = min(max(i0, 0), max(len(desc)-1, 0))
+        i1 = min(max(i1, 0), max(len(desc)-1, 0))
+        subset = desc[min(i0, i1):max(i0, i1)+1]
+    else:
+        d0 = _parse_dt(args.date_start) if args.date_start else datetime.min
+        d1 = _parse_dt(args.date_end) if args.date_end else datetime.max
+        subset = []
+        for r in desc:
+            try:
+                rd = _parse_dt(str(r.get("timestamp")))
+            except Exception:
+                continue
+            if rd >= d0 and rd <= d1:
+                subset.append(r)
+
+    period_start = subset[-1]["timestamp"] if subset else (base[0]["timestamp"] if base else "N/D")
+    period_end   = subset[0]["timestamp"] if subset else (base[-1]["timestamp"] if base else "N/D")
+
+    # calcolo KPI
+    rows = []
+    scores = []
+    areas_green, areas_red_or_yellow = [], []
+
+    for k, label in ENV_KPI_ORDER:
+        tdef = targets.get(k, {})
+        unit = tdef.get("unit", "")
+
+        # value corrente: media nel subset per KPI ambientali
+        if subset:
+            vals = [r.get(k) for r in subset if r.get(k) is not None]
+            # fallback su nomi alternativi
+            if not vals and k == "vibration_g":
+                vals = [(r.get("acceleration")/9.81) for r in subset if r.get("acceleration") is not None]
+            value = _avg(vals)
+        else:
+            value = None
+
+        # trend
+        delta = _trend_delta(desc, k, win_n)
+        trend = _trend_arrow(delta, trend_eps)
+
+        # status
+        status = _status_from_targets(value, tdef) if tdef else ("na" if value is None else "na")
+        scores.append(_score_from_status(status))
+
+        if status == "green":
+            areas_green.append(label)
+        elif status in ("yellow", "red"):
+            areas_red_or_yellow.append(label)
+
+        # target string
+        target_str = _mk_target_str_env(k, tdef) if tdef else "—"
+
+        rows.append({
+            "key": k,
+            "label": label,
+            "value": value,
+            "value_str": f"{_fmt_num(value, args.decimals)}{(' ' + unit) if unit and value is not None else ''}" if value is not None else "N/D",
+            "target": target_str,
+            "status": status,
+            "status_emoji": _status_emoji(status),
+            "trend": trend
+        })
+
+    # score & sintesi
+    scores_eff = [s for s in scores if s is not None]
+    overall = round(sum(scores_eff)/len(scores_eff), 1) if scores_eff else 0.0
+    fascia = "Eccellente 90-100" if overall >= 90 else ("Buono 70-89" if overall >= 70 else "Critico <70")
+
+    # raccomandazioni (top 3 KPI peggiori)
+    worst = sorted(rows, key=lambda r: {"green":3, "yellow":2, "red":1, "na":0}[r["status"]])[:3]
+    suggest_map = {
+        "Temperatura media ambiente": "Ottimizzare setpoint HVAC e manutenzione filtri/ventilazione.",
+        "Umidità relativa media": "Regolare deumidificazione/umidificazione per la finestra ottimale del lino.",
+        "Luminosità ambientale": "Tarare livelli luce e sensori presenza; sfruttare luce naturale.",
+        "Livello vibrazioni macchine": "Eseguire analisi vibrazionale e manutenzione predittiva (cuscinetti/allineamenti).",
+        "Consumo energetico specifico": "Audit energetico su compressori, trazione telai e HVAC.",
+        "Consumo idrico specifico": "Ricircolo/processi a umido efficienti e monitoraggio perdite.",
+        "CO2eq.ris./CO2eq.tot": "Valutare opportunità di recupero calore e materie prime a minor footprint.",
+    }
+    recs = []
+    if worst:
+        for w in worst:
+            recs.append({
+                "azione": f"Priorità su: {w['label']}",
+                "impatto_stimato": "Medio/Alto" if w["status"] in ("red",) else "Medio",
+                "nota": suggest_map.get(w["label"], "Intervento mirato per rientrare nel target.")
+            })
+    # almeno 3 righe, anche se ripetitive
+    while len(recs) < 3:
+        recs.append({"azione":"Ottimizzazione operativa mirata","impatto_stimato":"Medio","nota":"Azioni di breve termine su parametri fuori soglia."})
+
+    if args.output_mode == "json":
+        return {
+            "period": {"start": period_start, "end": period_end},
+            "facility": args.facility or "N/D",
+            "kpis": {
+                r["key"]: {
+                    "label": r["label"],
+                    "current": r["value"],
+                    "display": r["value_str"],
+                    "target": r["target"],
+                    "status": r["status"],
+                    "trend": r["trend"],
+                } for r in rows
+            },
+            "score_overall": overall,
+            "score_band": fascia,
+            "areas_of_excellence": areas_green,
+            "areas_of_improvement": areas_red_or_yellow,
+            "recommendations": recs
+        }
+
+    # output markdown (template)
+    def _mk_row(r: Dict[str, Any]) -> str:
+        return f"| {r['label']} | {r['value_str']} | {r['target']} | {r['status_emoji']} | {r['trend']} |"
+
+    md = []
+    md.append("**OUTPUT - REPORT SOSTENIBILITÀ AMBIENTALE (DRAFT)**")
+    md.append(f"\n**Periodo di riferimento:** `{period_start}` – `{period_end}`  •  **Stabilimento:** `{args.facility or 'None'}`\n")
+    md.append("**INDICATORI CHIAVE DI PERFORMANCE (KPI)**")
+    md.append("\n| Parametro | Valore Attuale | Target | Status | Trend |")
+    md.append("|---|---:|---:|:--:|:--:|")
+    for r in rows:
+        md.append(_mk_row(r))
+
+    md.append("\n**SINTESI PERFORMANCE AMBIENTALI**")
+    md.append(f"\nPunteggio complessivo sostenibilità: **{overall}/100**  •  Fascia: **{fascia}**")
+    if areas_green:
+        md.append(f"\n**Aree di eccellenza:** {', '.join(areas_green)}")
+    else:
+        md.append("\n**Aree di eccellenza:** N/D")
+    if areas_red_or_yellow:
+        md.append(f"\n**Aree di miglioramento:** {', '.join(areas_red_or_yellow)}")
+    else:
+        md.append("\n**Aree di miglioramento:** N/D")
+
+    md.append("\n**RACCOMANDAZIONI PRIORITARIE**")
+    for i, r in enumerate(recs, 1):
+        md.append(f"{i}. **[Azione]** {r['azione']} — Impatto stimato: *{r['impatto_stimato']}*. {r['nota']}")
+
+    return "\n".join(md)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TOOL 3 — Report Sociale
+# ─────────────────────────────────────────────────────────────────────────────
+SOC_KPI_ORDER = [
+    ("turnover_pct", "Tasso di turnover del personale"),
+    ("training_hours_per_employee_y", "Ore di formazione per dipendente"),
+    ("satisfaction_index", "Indice di soddisfazione dipendenti"),
+    ("absenteeism_pct", "Tasso di assenteismo"),
+    ("gender_female_pct", "Diversità di genere (% donne)"),
+    ("accidents_per_1000h", "Infortuni sul lavoro (per 1000 ore)"),
+    ("salary_vs_benchmark_pct", "Salario medio vs. benchmark settore"),
+    ("ethical_suppliers_pct", "Fornitori certificati eticamente"),
+    ("overtime_hours_per_employee_m", "Ore straordinarie per dipendente"),
+    ("community_projects_count", "Coinvolgimento comunità locale"),
+]
+
+class SocialReportArgs(BaseModel):
+    """Input per generare il Report Sociale (markdown o json)."""
+    by: Literal["index", "date"] = Field(
+        default="index",
+        description="Selezione dati.",
+        json_schema_extra={"example": "index"},
+    )
+    idx_start: Optional[int] = Field(
+        default=0,
+        ge=0,
+        description="Indice di inizio (solo by='index').",
+        json_schema_extra={"example": 0},
+    )
+    idx_end: Optional[int] = Field(
+        default=0,
+        ge=0,
+        description="Indice di fine incluso (solo by='index').",
+        json_schema_extra={"example": 3},
+    )
+    date_start: Optional[str] = Field(
+        default=None,
+        description="Data/DateTime inizio (solo by='date').",
+        json_schema_extra={"example": "2025-04-01"},
+    )
+    date_end: Optional[str] = Field(
+        default=None,
+        description="Data/DateTime fine inclusiva (solo by='date').",
+        json_schema_extra={"example": "2025-06-30"},
+    )
+    facility: Optional[str] = Field(
+        default="",
+        description="Filtro stabilimento (solo SOCIAL).",
+        json_schema_extra={"example": "Stabilimento_Lino_B"},
+    )
+    output_mode: Literal["text", "json"] = Field(
+        default="text",
+        description="Formato report.",
+        json_schema_extra={"example": "text"},
+    )
+    decimals: int = Field(
+        default=1,
+        ge=0,
+        le=6,
+        description="Decimali per resa testuale.",
+        json_schema_extra={"example": 1},
+    )
+
+    class Config:
+        schema_extra = {
+            "examples": [
+                {"by":"index","idx_start":0,"idx_end":0,"facility":"Stabilimento_Lino_B","output_mode":"text"},
+                {"by":"date","date_start":"2025-04-01","date_end":"2025-06-30","output_mode":"json"},
+            ]
+        }
+
+def _normalize_satisfaction(v: Optional[float], scale_in: Optional[float], targets: Dict[str, Any]) -> Optional[float]:
+    if v is None:
+        return None
+    # i targets sono su scala 0-100; i dati possono arrivare su 0-10
+    scale_tgt = float(targets.get("satisfaction_index", {}).get("scale", 100))
+    if not scale_in:
+        return v  # assume già compatibile
+    try:
+        return float(v) * (scale_tgt / float(scale_in))
+    except Exception:
+        return None
+
+def generate_social_report_tool(args: SocialReportArgs) -> Any:
+    """
+    Descrizione:
+    Genera il **Report di Sostenibilità Sociale** nel formato del template.
+    Valuta ogni KPI contro i target e calcola score, aree di eccellenza/miglioramento.
+    Supporta output 'text' (markdown) o 'json'.
+
+    Ritorna:
+    - Se output_mode='text' → stringa markdown.
+    - Se output_mode='json' → dict strutturato.
+    """
+    targets_all = _load_targets()
+    targets = targets_all.get("social", {})
+    trend_eps = float(targets.get("trend_epsilon", 0.1))
+    win_n = int(targets.get("trend_window_n", 3))
+
+    base = _load_social_rows()
+    if args.facility:
+        base = [r for r in base if r.get("facility") == args.facility]
+    desc = list(reversed(base))  # più recente per primo
+
+    # selezione
+    if args.by == "index":
+        i0 = args.idx_start or 0
+        i1 = args.idx_end if args.idx_end is not None else i0
+        i0 = min(max(i0, 0), max(len(desc)-1, 0))
+        i1 = min(max(i1, 0), max(len(desc)-1, 0))
+        subset = desc[min(i0, i1):max(i0, i1)+1]
+    else:
+        key_dt = "saved_at" if any("saved_at" in r for r in desc) else "period_end"
+        d0 = _parse_dt(args.date_start) if args.date_start else datetime.min
+        d1 = _parse_dt(args.date_end) if args.date_end else datetime.max
+        subset = []
+        for r in desc:
+            try:
+                rd = _parse_dt(str(r.get(key_dt)))
+            except Exception:
+                continue
+            if rd >= d0 and rd <= d1:
+                subset.append(r)
+
+    # periodo
+    if subset:
+        period_start = subset[-1].get("period_start", "N/D")
+        period_end   = subset[0].get("period_end", "N/D")
+        facility = subset[0].get("facility", args.facility or "N/D")
+    else:
+        period_start = period_end = "N/D"
+        facility = args.facility or "N/D"
+
+    # trends: confronto con righe precedenti
+    def _trend_key(key: str) -> Optional[float]:
+        prev = [r.get(key) for r in desc[1:1+win_n] if r.get(key) is not None]
+        cur = desc[0].get(key) if desc else None
+        if cur is None or not prev:
+            return None
+        try:
+            return float(cur) - (sum(float(x) for x in prev) / len(prev))
+        except Exception:
+            return None
+
+    # riga corrente (uso l’ultimo record del subset, cioè il più recente)
+    current = subset[0] if subset else {}
+
+    rows = []
+    scores = []
+    areas_green, areas_red_or_yellow = [], []
+
+    for k, label in SOC_KPI_ORDER:
+        tdef = targets.get(k, {})
+        unit_disp = {
+            "turnover_pct": "%",
+            "training_hours_per_employee_y": "h/anno",
+            "satisfaction_index": "/10",
+            "absenteeism_pct": "%",
+            "gender_female_pct": "%",
+            "accidents_per_1000h": "",
+            "salary_vs_benchmark_pct": "%",
+            "ethical_suppliers_pct": "%",
+            "overtime_hours_per_employee_m": "h/mese",
+            "community_projects_count": "progetti",
+        }.get(k, "")
+
+        raw_val = current.get(k)
+        if k == "satisfaction_index":
+            # normalizza per la valutazione (scala 0-100)
+            scaled = _normalize_satisfaction(
+                raw_val,
+                current.get("satisfaction_scale"),
+                targets_all.get("social", {})
+            )
+            value_for_status = scaled
+        else:
+            value_for_status = float(raw_val) if raw_val is not None else None
+
+        status = _status_from_targets(value_for_status, tdef) if tdef else ("na" if value_for_status is None else "na")
+        scores.append(_score_from_status(status))
+
+        trend = _trend_arrow(_trend_key(k), trend_eps)
+
+        if status == "green":
+            areas_green.append(label)
+        elif status in ("yellow", "red"):
+            areas_red_or_yellow.append(label)
+
+        # visualizzazione valore attuale coerente al template
+        if raw_val is None:
+            val_str = "N/D"
+        elif k == "satisfaction_index":
+            # mostra su scala originale /10 se fornita
+            sc = current.get("satisfaction_scale", 10)
+            if float(sc) == 10:
+                val_str = f"{_fmt_num(raw_val, args.decimals)}/10"
+            else:
+                val_str = f"{_fmt_num(raw_val, args.decimals)}"
+        else:
+            val_str = f"{_fmt_num(raw_val, args.decimals)}{(' ' + unit_disp) if unit_disp else ''}".strip()
+
+        rows.append({
+            "key": k,
+            "label": label,
+            "value": raw_val,
+            "display": val_str,
+            "target": _mk_target_str_soc(k, tdef),
+            "status": status,
+            "status_emoji": _status_emoji(status),
+            "trend": trend,
+        })
+
+    # score & sintesi
+    scores_eff = [s for s in scores if s is not None]
+    overall = round(sum(scores_eff)/len(scores_eff), 1) if scores_eff else 0.0
+    fascia = "Eccellente 90-100" if overall >= 90 else ("Buono 70-89" if overall >= 70 else "Critico <70")
+
+    # raccomandazioni (top 3 peggiori KPI)
+    worst = sorted(rows, key=lambda r: {"green":3, "yellow":2, "red":1, "na":0}[r["status"]])[:3]
+    suggest_map = {
+        "Tasso di turnover del personale": "Programmi di retention e piani di carriera.",
+        "Ore di formazione per dipendente": "Aumentare formazione tecnica/sicurezza (>24h/anno).",
+        "Indice di soddisfazione dipendenti": "Survey mirate e azioni su feedback critici.",
+        "Tasso di assenteismo": "Welfare, flessibilità e prevenzione infortuni.",
+        "Diversità di genere (% donne)": "Recruiting inclusivo e mentoring.",
+        "Infortuni sul lavoro (per 1000 ore)": "Safety walk, formazione e manutenzione preventiva.",
+        "Salario medio vs. benchmark settore": "Allineamento retributivo e leve non monetarie.",
+        "Fornitori certificati eticamente": "Qualifica fornitori e clausole ESG.",
+        "Ore straordinarie per dipendente": "Bilanciamento turni e automazione.",
+        "Coinvolgimento comunità locale": "Programmi CSR con partner territoriali.",
+    }
+    recs = []
+    for w in worst:
+        recs.append({
+            "azione": f"Priorità su: {w['label']}",
+            "impatto_stimato": "Alto" if w["status"] == "red" else "Medio",
+            "nota": suggest_map.get(w["label"], "Intervento mirato per rientrare nel target.")
+        })
+    while len(recs) < 3:
+        recs.append({"azione":"Azioni organizzative e formative","impatto_stimato":"Medio","nota":"Migliorare gli indicatori sotto target."})
+
+    if args.output_mode == "json":
+        return {
+            "period": {"start": period_start, "end": period_end},
+            "facility": facility,
+            "kpis": {
+                r["key"]: {
+                    "label": r["label"],
+                    "current": r["value"],
+                    "display": r["display"],
+                    "target": r["target"],
+                    "status": r["status"],
+                    "trend": r["trend"],
+                } for r in rows
+            },
+            "score_overall": overall,
+            "score_band": fascia,
+            "areas_of_excellence": areas_green,
+            "areas_of_improvement": areas_red_or_yellow,
+            "recommendations": recs
+        }
+
+    # markdown (template)
+    def _mk_row(r: Dict[str, Any]) -> str:
+        return f"| {r['label']} | {r['display']} | {r['target']} | {r['status_emoji']} | {r['trend']} |"
+
+    md = []
+    md.append("**OUTPUT - REPORT SOSTENIBILITÀ SOCIALE (DRAFT)**")
+    md.append(f"\n**Periodo di riferimento:** `{period_start}` – `{period_end}`  •  **Stabilimento:** `{facility}`\n")
+    md.append("**INDICATORI CHIAVE DI PERFORMANCE (KPI)**")
+    md.append("\n| Parametro | Valore Attuale | Target | Status | Trend |")
+    md.append("|---|---:|---:|:--:|:--:|")
+    for r in rows:
+        md.append(_mk_row(r))
+
+    md.append("\n**SINTESI PERFORMANCE SOCIALI**")
+    md.append(f"\nPunteggio complessivo sostenibilità sociale: **{overall}/100**  •  Fascia: **{fascia}**")
+    md.append(f"\n**Aree di eccellenza:** {', '.join(areas_green) if areas_green else 'N/D'}")
+    md.append(f"\n**Aree di miglioramento:** {', '.join(areas_red_or_yellow) if areas_red_or_yellow else 'N/D'}")
+
+    md.append("\n**RACCOMANDAZIONI PRIORITARIE**")
+    for i, r in enumerate(recs, 1):
+        md.append(f"{i}. **[Azione]** {r['azione']} — Impatto stimato: *{r['impatto_stimato']}*. {r['nota']}")
+
+    return "\n".join(md)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TOOL 4 — Lettura targets
+# ─────────────────────────────────────────────────────────────────────────────
+class GetTargetsArgs(BaseModel):
+    """Input per leggere i targets dal file di configurazione."""
+    section: Literal["environment", "social", "all"] = Field(
+        default="all",
+        description="Sezione richiesta.",
+        json_schema_extra={"example": "all"},
+    )
+
+    class Config:
+        schema_extra = {"examples": [{"section":"all"},{"section":"environment"},{"section":"social"}]}
+
+
+def get_kpi_targets_tool(args: GetTargetsArgs) -> Dict[str, Any]:
+    """
+    Descrizione:
+    Restituisce i targets correnti dal file configurato. Se il file non esiste
+    viene creato automaticamente con i default.
+
+    Output:
+    - section richiesta (o entrambe) come dict Python (JSON-serializable).
+    """
+    t = _load_targets()
+    if args.section == "all":
+        return t
+    return {args.section: t.get(args.section, {})}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ✨ NEW: MODELLI + TOOL DI LETTURA SPECIALIZZATI (ENV / SOCIAL)
+#     - Wrapper leggeri sopra read_kpi_data_tool
+#     - Stesse regole: indice 0 = più recente; filtri data inclusivi
+# ─────────────────────────────────────────────────────────────────────────────
+
+# --- Pydantic models ---------------------------------------------------------
+
+class ReadEnvDataArgs(BaseModel):
+    """
+    Input per lettura **solo dati ambientali** (ENV).
+    Selezione per indici (0 = più recente) o per date (intervallo inclusivo).
+    """
+    by: Literal["index", "date"] = Field(
+        default="index", description="Modalità di selezione (index | date).",
+        json_schema_extra={"example": "index"},
+    )
+    idx_start: Optional[int] = Field(
+        default=0, ge=0, description="Indice di inizio (solo by='index').",
+        json_schema_extra={"example": 0},
+    )
+    idx_end: Optional[int] = Field(
+        default=0, ge=0, description="Indice di fine incluso (solo by='index').",
+        json_schema_extra={"example": 300},
+    )
+    date_start: Optional[str] = Field(
+        default=None, description="Data/DateTime inizio (solo by='date').",
+        json_schema_extra={"example": "2025-09-01"},
+    )
+    date_end: Optional[str] = Field(
+        default=None, description="Data/DateTime fine inclusiva (solo by='date').",
+        json_schema_extra={"example": "2025-09-15T23:59:59"},
+    )
+    #fields: Optional[List[str]] = Field(
+    #    default_factory=list, description="Proiezione campi (vuoto = tutti).",
+    #    json_schema_extra={"example": ["timestamp", "temperature", "humidity", "vibration_g"]},
+    #)
+    #order: Literal["desc", "asc"] = Field(
+    #    default="desc", description="Ordinamento del risultato.",
+    #    json_schema_extra={"example": "desc"},
+    #)
+
+    class Config:
+        schema_extra = {
+            "examples": [
+                {"by":"index","idx_start":0,"idx_end":100},
+                {"by":"date","date_start":"2025-09-01","date_end":"2025-09-07"},
+            ]
+        }
+
+
+class ReadSocialDataArgs(BaseModel):
+    """
+    Input per lettura **solo dati sociali** (SOCIAL).
+    Selezione per indici (0 = più recente) o per date (intervallo inclusivo) + filtro facility.
+    """
+    by: Literal["index", "date"] = Field(
+        default="index", description="Modalità di selezione (index | date).",
+        json_schema_extra={"example": "date"},
+    )
+    idx_start: Optional[int] = Field(
+        default=0, ge=0, description="Indice di inizio (solo by='index').",
+        json_schema_extra={"example": 0},
+    )
+    idx_end: Optional[int] = Field(
+        default=0, ge=0, description="Indice di fine incluso (solo by='index').",
+        json_schema_extra={"example": 2},
+    )
+    date_start: Optional[str] = Field(
+        default=None, description="Data/DateTime inizio (solo by='date').",
+        json_schema_extra={"example": "2025-04-01"},
+    )
+    date_end: Optional[str] = Field(
+        default=None, description="Data/DateTime fine inclusiva (solo by='date').",
+        json_schema_extra={"example": "2025-06-30"},
+    )
+    facility: Optional[str] = Field(
+        default="", description="Filtro stabilimento (es. 'Stabilimento_Lino_B').",
+        json_schema_extra={"example": "Stabilimento_Lino_B"},
+    )
+    #fields: Optional[List[str]] = Field(
+    #    default_factory=list, description="Proiezione campi (vuoto = tutti).",
+    #    json_schema_extra={"example": ["period_start","period_end","turnover_pct","satisfaction_index"]},
+    #)
+    #order: Literal["desc", "asc"] = Field(
+    #    default="desc", description="Ordinamento del risultato.",
+    #    json_schema_extra={"example": "desc"},
+    #)
+
+    class Config:
+        schema_extra = {
+            "examples": [
+                {"by":"index","idx_start":0,"idx_end":0,"facility":"Stabilimento_Lino_B"},
+                {"by":"date","date_start":"2025-01-01","date_end":"2025-03-31"},
+            ]
+        }
+
+
+# --- Wrapper functions (richiamano read_kpi_data_tool) -----------------------
+
+def read_env_data_tool(args: ReadEnvDataArgs) -> Dict[str, Any]:
+    """
+    Lettura **specializzata ENV**.
+    Reindirizza a `read_kpi_data_tool` impostando `kind='env'`.
+    Output: {'kind':'env','count':<int>,'items':[...]} (ordinati secondo `order`).
+    """
+    # Riusa lo schema già definito per il tool generico
+    generic = ReadKpiDataArgs(
+        kind="env",
+        by=args.by,
+        idx_start=args.idx_start,
+        idx_end=args.idx_end,
+        date_start=args.date_start,
+        date_end=args.date_end,
+        #fields=args.fields,
+        #order=args.order,
+    )
+    return read_kpi_data_tool(generic)
+
+
+def read_social_data_tool(args: ReadSocialDataArgs) -> Dict[str, Any]:
+    """
+    Lettura **specializzata SOCIAL**.
+    Reindirizza a `read_kpi_data_tool` impostando `kind='social'` e applicando `facility`.
+    Output: {'kind':'social','count':<int>,'items':[...]} (ordinati secondo `order`).
+    """
+    generic = ReadKpiDataArgs(
+        kind="social",
+        by=args.by,
+        idx_start=args.idx_start,
+        idx_end=args.idx_end,
+        date_start=args.date_start,
+        date_end=args.date_end,
+        facility=args.facility,
+        #fields=args.fields,
+        #order=args.order,
+    )
+    return read_kpi_data_tool(generic)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TOOL 5 — DSS/AHP Report (Semplificato: solo default interni)
+# ─────────────────────────────────────────────────────────────────────────────
+class DSSReportArgs(BaseModel):
+    """Input per generare report DSS (AHP) con categorie ENV/SOC/FIN usando solo default interni."""
+    by: Literal["index", "date"] = Field(default="index", description="Selezione dati ENV/SOC.")
+    idx_start: Optional[int] = Field(default=0, ge=0, description="Indice inizio (solo by='index').")
+    idx_end: Optional[int] = Field(default=0, ge=0, description="Indice fine incluso (solo by='index').")
+    date_start: Optional[str] = Field(default=None, description="Data/DateTime inizio (solo by='date').")
+    date_end: Optional[str] = Field(default=None, description="Data/DateTime fine inclusiva (solo by='date').")
+    facility: Optional[str] = Field(default="", description="Filtro stabilimento per SOCIAL (opzionale).")
+    output_mode: Literal["text", "json"] = Field(default="text", description="Formato output.")
+    decimals: int = Field(default=2, ge=0, le=6, description="Decimali per valori/score.")
+
+    class Config:
+        schema_extra = {
+            "examples": [
+                {"by": "index", "idx_start": 0, "idx_end": 200, "output_mode": "text"},
+                {"by": "date", "date_start": "2025-01-01", "date_end": "2025-03-31", "facility": "Stabilimento_Lino_B", "output_mode": "json"}
+            ]
+        }
+
+def generate_dss_report_tool(args: DSSReportArgs) -> Any:
+    """
+    Genera un **Report DSS/AHP** combinando categorie (ENV/SOC/FIN) e indicatori interni con soli default.
+    - Recupera i KPI ENV e SOCIAL dal dataset (finestra per indici o per date, filtri inclusivi).
+    - Normalizza i KPI in 0–1 dal loro **status**: 🟢=1.0, 🟡=0.8, 🔴=0.5, ⚪=0.0.
+    - KPI FINANZIARI: usa **valori di default interni** (non configurabili da input).
+    - Pesi AHP:
+        • Matrice categorie (A) fissa (ENV,SOC,FIN) dal documento DSS.
+        • Matrici interne (B) = equal-weight (costruite con _pairwise_equal_matrix(n)).
+    - Score finale = Σ_c ( w_cat[c] × Σ_i ( w_intra[c,i] × norm[c,i] ) ).
+
+    Output:
+      - 'text' → markdown template DSS.
+      - 'json' → struttura JSON con pesi, CR, dettagli e ranking.
+    """
+    # ---------- 1) Targets e dati base ----------
+    targets_all = _load_targets()
+    t_env = targets_all.get("environment", {})
+    t_soc = targets_all.get("social", {})
+
+    # ENV: carica e seleziona subset
+    env_base = _load_env_rows()
+    env_desc = list(reversed(env_base))
+    if args.by == "index":
+        i0 = args.idx_start or 0
+        i1 = args.idx_end if args.idx_end is not None else i0
+        i0 = min(max(i0, 0), max(len(env_desc)-1, 0))
+        i1 = min(max(i1, 0), max(len(env_desc)-1, 0))
+        env_subset = env_desc[min(i0, i1):max(i0, i1)+1]
+    else:
+        d0 = _parse_dt(args.date_start) if args.date_start else datetime.min
+        d1 = _parse_dt(args.date_end) if args.date_end else datetime.max
+        env_subset = []
+        for r in env_desc:
+            try:
+                rd = _parse_dt(str(r.get("timestamp")))
+            except Exception:
+                continue
+            if d0 <= rd <= d1:
+                env_subset.append(r)
+    # conversione vibrazioni se serve
+    for r in env_subset:
+        if "acceleration" in r and "vibration_g" not in r:
+            try:
+                r["vibration_g"] = float(r["acceleration"]) / 9.81
+            except Exception:
+                pass
+
+    # SOCIAL: carica e seleziona subset
+    soc_base = _load_social_rows()
+    if args.facility:
+        soc_base = [r for r in soc_base if r.get("facility") == args.facility]
+    soc_desc = list(reversed(soc_base))
+    if args.by == "index":
+        j0 = args.idx_start or 0
+        j1 = args.idx_end if args.idx_end is not None else j0
+        j0 = min(max(j0, 0), max(len(soc_desc)-1, 0))
+        j1 = min(max(j1, 0), max(len(soc_desc)-1, 0))
+        soc_subset = soc_desc[min(j0, j1):max(j0, j1)+1]
+    else:
+        key_dt = "saved_at" if any("saved_at" in r for r in soc_desc) else "period_end"
+        d0 = _parse_dt(args.date_start) if args.date_start else datetime.min
+        d1 = _parse_dt(args.date_end) if args.date_end else datetime.max
+        soc_subset = []
+        for r in soc_desc:
+            try:
+                rd = _parse_dt(str(r.get(key_dt)))
+            except Exception:
+                continue
+            if d0 <= rd <= d1:
+                soc_subset.append(r)
+
+    # Periodo/facility
+    period_start = (env_subset[-1]["timestamp"] if env_subset else (soc_subset[-1].get("period_start") if soc_subset else "N/D")) if (env_subset or soc_subset) else "N/D"
+    period_end   = (env_subset[0]["timestamp"]  if env_subset else (soc_subset[0].get("period_end")   if soc_subset else "N/D")) if (env_subset or soc_subset) else "N/D"
+    facility = (soc_subset[0].get("facility") if soc_subset and soc_subset[0].get("facility") else (args.facility or "N/D"))
+
+    # ---------- 2) Aggregazione & normalizzazione (0–1) ----------
+    # ENV: media sul subset per ciascun KPI con soglia
+    env_values = {}
+    for k in ENV_KPI_FOR_DSS:
+        tdef = t_env.get(k, {})
+        if not _has_thresholds(tdef):
+            continue
+        vals = [r.get(k) for r in env_subset if r.get(k) is not None]
+        if not vals and k == "vibration_g":
+            vals = [(r.get("acceleration")/9.81) for r in env_subset if r.get("acceleration") is not None]
+        value = _avg(vals) if vals else None
+        status = _status_from_targets(value, tdef) if value is not None else "na"
+        env_values[k] = {"value": value, "status": status, "norm": _status_to_norm01(status)}
+
+    # SOCIAL: media sul subset; satisfaction normalizzata su 0–100 per lo status
+    soc_values = {}
+    for k, _label in SOC_KPI_ORDER:
+        tdef = t_soc.get(k, {})
+        if not _has_thresholds(tdef):
+            continue
+        raw_list = [r.get(k) for r in soc_subset if r.get(k) is not None]
+        if k == "satisfaction_index":
+            scaled_list = []
+            for r in soc_subset:
+                v = r.get("satisfaction_index")
+                if v is None:
+                    continue
+                sc = r.get("satisfaction_scale")
+                scaled = _normalize_satisfaction(v, sc, t_soc)
+                if scaled is not None:
+                    scaled_list.append(scaled)
+            v_mean_for_status = _avg(scaled_list) if scaled_list else None
+            value = _avg(raw_list) if raw_list else None
+            status = _status_from_targets(v_mean_for_status, tdef) if v_mean_for_status is not None else "na"
+        else:
+            value = _avg(raw_list) if raw_list else None
+            status = _status_from_targets(value, tdef) if value is not None else "na"
+        soc_values[k] = {"value": value, "status": status, "norm": _status_to_norm01(status)}
+
+    # FIN: valori 0–1 di default interni (nessun input)
+    fin_values = {}
+    _FIN_DEFAULTS = {
+        "sustainable_cost_index": 0.60,
+        "energy_efficiency_index": 0.70,
+        "revenue_impact_index": 0.55,
+    }
+    for k, _label in FIN_KPI_ORDER:
+        v = float(_FIN_DEFAULTS[k])
+        status = "green" if v >= 0.8 else ("yellow" if v >= 0.6 else "red")
+        fin_values[k] = {"value": v, "status": status, "norm": v}
+
+    # ---------- 3) Pesi AHP (solo default interni) ----------
+    # Matrice categorie (A) fissa dal documento DSS
+    cat_A = [
+        [1.0, 3.0, 2.0],
+        [1.0/3.0, 1.0, 0.5],
+        [0.5, 2.0, 1.0],
+    ]
+    w_cat, cr_cat = _ahp_weights_and_cr(cat_A)
+
+    # Matrici interne (B) = equal-weight in base ai KPI disponibili
+    env_keys = [k for k in ENV_KPI_FOR_DSS if k in env_values]
+    soc_keys = [k for k, _ in SOC_KPI_ORDER if k in soc_values]
+    fin_keys = [k for k, _ in FIN_KPI_ORDER if k in fin_values]
+
+    def _equal_weights_for(keys):
+        n = len(keys)
+        if n == 0:
+            return [], 0.0
+        return _ahp_weights_and_cr(_pairwise_equal_matrix(n))
+
+    w_env, cr_env = _equal_weights_for(env_keys)
+    w_soc, cr_soc = _equal_weights_for(soc_keys)
+    w_fin, cr_fin = _equal_weights_for(fin_keys)
+
+    # ---------- 4) Score per categoria e globale ----------
+    def _cat_score(keys, weights, bucket):
+        if not keys or not weights:
+            return 0.0
+        return sum(weights[i] * float(bucket[keys[i]]["norm"]) for i in range(len(keys)))
+
+    score_env = _cat_score(env_keys, w_env, env_values)
+    score_soc = _cat_score(soc_keys, w_soc, soc_values)
+    score_fin = _cat_score(fin_keys, w_fin, fin_values)
+
+    overall = (
+        (w_cat[0] if len(w_cat) > 0 else 0.0) * score_env +
+        (w_cat[1] if len(w_cat) > 1 else 0.0) * score_soc +
+        (w_cat[2] if len(w_cat) > 2 else 0.0) * score_fin
+    )
+
+    ranking = sorted(
+        [
+            {"category": "Ambientale", "score": round(score_env, args.decimals)},
+            {"category": "Sociale", "score": round(score_soc, args.decimals)},
+            {"category": "Economico", "score": round(score_fin, args.decimals)},
+        ],
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    notes = []
+    if cr_cat > 0.1: notes.append(f"Attenzione: CR Matrice Categorie = {cr_cat:.3f} > 0.1")
+    if cr_env > 0.1 and env_keys: notes.append(f"CR ENV = {cr_env:.3f} > 0.1")
+    if cr_soc > 0.1 and soc_keys: notes.append(f"CR SOCIAL = {cr_soc:.3f} > 0.1")
+    if cr_fin > 0.1 and fin_keys: notes.append(f"CR FIN = {cr_fin:.3f} > 0.1")
+    if not (env_subset or soc_subset):
+        notes.append("Attenzione: nessun record nel range selezionato (score derivato da default FIN).")
+    else:
+        notes.append("Indicatori FIN calcolati da default interni (non personalizzati da input).")
+
+    # ---------- 5) Output ----------
+    if args.output_mode == "json":
+        return {
+            "period": {"start": period_start, "end": period_end},
+            "facility": facility,
+            "ahp": {
+                "category": {"weights": {"ENV": w_cat[0], "SOC": w_cat[1], "FIN": w_cat[2]}, "cr": cr_cat},
+                "environment": {"indicators": {k: w_env[i] for i, k in enumerate(env_keys)}, "cr": cr_env},
+                "social": {"indicators": {k: w_soc[i] for i, k in enumerate(soc_keys)}, "cr": cr_soc},
+                "financial": {"indicators": {k: w_fin[i] for i, k in enumerate(fin_keys)}, "cr": cr_fin},
+            },
+            "indicators": {
+                "environment": env_values,
+                "social": soc_values,
+                "financial": fin_values,
+            },
+            "scores": {
+                "environment": round(score_env, args.decimals),
+                "social": round(score_soc, args.decimals),
+                "financial": round(score_fin, args.decimals),
+                "overall": round(overall, args.decimals),
+            },
+            "ranking": ranking,
+            "notes": notes,
+        }
+
+    # Markdown
+    def _mk_table(keys, weights, bucket, header):
+        lines = [
+            f"\n**{header}**",
+            "\n| Indicatore | Norm. (0–1) | Peso interno | Score parziale |",
+            "|---|---:|---:|---:|",
+        ]
+        for i, k in enumerate(keys):
+            norm = bucket[k]["norm"]
+            sc = (weights[i] * norm) if weights else 0.0
+            lines.append(f"| {k} | {norm:.{args.decimals}f} | {(weights[i] if weights else 0.0):.{args.decimals}f} | {sc:.{args.decimals}f} |")
+        return "\n".join(lines)
+
+    md = []
+    md.append("**OUTPUT - REPORT DSS / AHP (DRAFT)**")
+    md.append(f"\n**Periodo di riferimento:** `{period_start}` – `{period_end}`  •  **Stabilimento:** `{facility}`\n")
+    md.append(f"**Pesi categorie (A) [CR={cr_cat:.3f}]**  \nENV: {w_cat[0]:.{args.decimals}f}  •  SOC: {w_cat[1]:.{args.decimals}f}  •  FIN: {w_cat[2]:.{args.decimals}f}")
+
+    md.append(_mk_table(env_keys, w_env, env_values, f"Categoria Ambientale (CR={cr_env:.3f})"))
+    md.append(_mk_table(soc_keys, w_soc, soc_values, f"Categoria Sociale (CR={cr_soc:.3f})"))
+    md.append(_mk_table(fin_keys, w_fin, fin_values, f"Categoria Economica/Finanziaria (CR={cr_fin:.3f})"))
+
+    md.append("\n**SCORE DI CATEGORIA**")
+    md.append(f"- Ambientale: **{score_env:.{args.decimals}f}**")
+    md.append(f"- Sociale: **{score_soc:.{args.decimals}f}**")
+    md.append(f"- Economico: **{score_fin:.{args.decimals}f}**")
+
+    md.append(f"\n**SCORE FINALE (AHP)**: **{overall:.{args.decimals}f}**")
+
+    md.append("\n**RANKING PRIORITÀ**")
+    for i, r in enumerate(ranking, 1):
+        md.append(f"{i}. {r['category']} — score {r['score']:.{args.decimals}f}")
+
+    if notes:
+        md.append("\n**NOTE**")
+        for n in notes:
+            md.append(f"- {n}")
+
+    return "\n".join(md)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Esportazione tool in formato LangChain
+# (Puoi scegliere subset per ogni agente nel tuo core.)
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Re-binding dei Structured Tools con wrapper (nessuna logica cambiata)
+# ─────────────────────────────────────────────────────────────────────────────
+
+read_kpi_data = StructuredTool.from_function(
+    func=_wrap_args(ReadKpiDataArgs, read_kpi_data_tool),
+    name="read_kpi_data",
+    description=(
+        "Legge dataset 'env' o 'social'. Invarianti: indice 0 = più recente; filtro date inclusivo; "
+        "facility solo per social; intervalli fuori range → restituisce ciò che è disponibile.\n"
+        "Esempi: "
+        "read_kpi_data(kind='env', by='index', idx_start=0, idx_end=100) | "
+        "read_kpi_data(kind='social', by='date', date_start='2025-01-01', date_end='2025-03-31', facility='Stabilimento_Lino_B')."
+    ),
+    args_schema=ReadKpiDataArgs,
+)
+
+generate_environment_report = StructuredTool.from_function(
+    func=_wrap_args(EnvReportArgs, generate_environment_report_tool),
+    name="generate_environment_report",
+    description=(
+        "Crea il Report Ambientale aderente al template. Usa targets per status, calcola trend e score medio. "
+        "Output: 'text' (markdown) o 'json' (strutturato). Selezione per indici o date.\n"
+        "Esempi: generate_environment_report(by='index', idx_start=0, idx_end=1440, output_mode='text') | "
+        "generate_environment_report(by='date', date_start='2025-09-01', date_end='2025-09-10', output_mode='json')."
+    ),
+    args_schema=EnvReportArgs,
+)
+
+generate_social_report = StructuredTool.from_function(
+    func=_wrap_args(SocialReportArgs, generate_social_report_tool),
+    name="generate_social_report",
+    description=(
+        "Crea il Report Sociale aderente al template. Normalizza satisfaction alla scala target, "
+        "valuta status vs targets, calcola trend e score. Output 'text' o 'json'. Supporta filtro 'facility'.\n"
+        "Esempi: generate_social_report(by='index', idx_start=0, idx_end=0, facility='Stabilimento_Lino_B') | "
+        "generate_social_report(by='date', date_start='2025-04-01', date_end='2025-06-30', output_mode='json')."
+    ),
+    args_schema=SocialReportArgs,
+)
+
+get_kpi_targets = StructuredTool.from_function(
+    func=_wrap_args(GetTargetsArgs, get_kpi_targets_tool),
+    name="get_kpi_targets",
+    description=(
+        "Ritorna i targets (environment/social). Se il file manca viene creato con default. "
+        "Esempi: get_kpi_targets(section='all') | get_kpi_targets(section='environment')."
+    ),
+    args_schema=GetTargetsArgs,
+)
+
+read_env_data = StructuredTool.from_function(
+    func=_wrap_args(ReadEnvDataArgs, read_env_data_tool),
+    name="read_env_data",
+    description=(
+        "Legge solo dati ambientali (ENV). Indice 0 = più recente; filtri date inclusivi; "
+        "intervalli fuori range gestiti. Esempi: read_env_data(by='index', idx_start=0, idx_end=200) | "
+        "read_env_data(by='date', date_start='2025-09-01', date_end='2025-09-07')."
+    ),
+    args_schema=ReadEnvDataArgs,
+)
+
+read_social_data = StructuredTool.from_function(
+    func=_wrap_args(ReadSocialDataArgs, read_social_data_tool),
+    name="read_social_data",
+    description=(
+        "Legge solo dati sociali (SOCIAL) con filtro facility opzionale. Indice 0 = più recente; "
+        "filtri date inclusivi; intervalli fuori range gestiti. Esempi: "
+        "read_social_data(by='index', idx_start=0, idx_end=0, facility='Stabilimento_Lino_B') | "
+        "read_social_data(by='date', date_start='2025-04-01', date_end='2025-06-30')."
+    ),
+    args_schema=ReadSocialDataArgs,
+)
+
+generate_dss_report = StructuredTool.from_function(
+    func=_wrap_args(DSSReportArgs, generate_dss_report_tool),
+    name="generate_dss_report",
+    description=(
+        "Genera un report DSS/AHP combinando categorie **ENV/SOC/FIN**. "
+        "Recupera i KPI ENV/SOC dal dataset (finestra per indici o date), normalizza 0–1 da status, "
+        "usa AHP per pesi di categorie e indicatori. I KPI finanziari sono simulati (override via "
+        "'financial_mock_values'). Output 'text' (markdown) o 'json'."
+    ),
+    args_schema=DSSReportArgs,
+)
+
+
+# Lista completa (puoi filtrare per modalità nel core)
+TOOLS = [generate_dss_report, read_env_data, read_social_data, read_kpi_data, generate_environment_report, generate_social_report, get_kpi_targets]
