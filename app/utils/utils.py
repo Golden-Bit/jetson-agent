@@ -51,7 +51,7 @@ from .tools import (
 os.environ.setdefault("OPENAI_BASE_URL", "http://localhost:11434/v1")
 os.environ.setdefault("OPENAI_API_KEY", "ollama")  # dummy key
 
-MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b-instruct-q4_K_M") #"llama3.1:8b-instruct-q4_K_M" #"llama3.3:70b-instruct-q4_K_M" #"qwen3:30b"
+MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b") #"llama3.1:8b-instruct-q4_K_M" #"llama3.3:70b-instruct-q4_K_M" #"qwen3:30b"
 TEMPERATURE = float(os.environ.get("AGENT_TEMPERATURE", "0.2"))
 HIDE_THINK = os.environ.get("HIDE_THINK", "true").lower() in ("1", "true", "yes")
 
