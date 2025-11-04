@@ -60,6 +60,11 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 # --------------------------------------------------------------------------
 # LLM condiviso
 # --------------------------------------------------------------------------
+
+print("BASE_URL=", os.getenv("OPENAI_BASE_URL"))
+print("API_KEY=", os.getenv("OPENAI_API_KEY"))
+print("MODEL=", os.getenv("OLLAMA_MODEL", MODEL))
+
 _llm = ChatOpenAI(
     model_name=MODEL,     # alias per la tua classe
     temperature=TEMPERATURE,
