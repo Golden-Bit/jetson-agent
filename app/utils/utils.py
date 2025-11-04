@@ -107,6 +107,8 @@ def _build_executor(mode: Mode) -> AgentExecutor:
     if not cfg:
         raise ValueError(f"Modalità non valida: {mode}. Valori ammessi: env | social | dss")
 
+    print(f"CFG= {cfg}")
+
     system_message = cfg["system_message"]
     tools = cfg["tools"]
     run_name = cfg["run_name"]
