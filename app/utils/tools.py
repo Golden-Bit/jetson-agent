@@ -1545,3 +1545,19 @@ generate_dss_report = StructuredTool.from_function(
 
 # Lista completa (puoi filtrare per modalità nel core)
 TOOLS = [generate_dss_report, read_env_data, read_social_data, read_kpi_data, generate_environment_report, generate_social_report, get_kpi_targets]
+
+##############################################
+class _PingArgs(BaseModel):
+    pass
+
+def _ping_impl(_: _PingArgs) -> str:
+    return "PONG"
+
+ping = StructuredTool.from_function(
+    func=_wrap_args(_PingArgs, _ping_impl),
+    name="ping",
+    description="Tool di test: ritorna sempre 'PONG'. Nessun argomento.",
+    args_schema=_PingArgs,
+)
+
+############################################
