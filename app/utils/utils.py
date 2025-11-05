@@ -42,7 +42,7 @@ from .system_message import (
 # Import dei tool (uno per modalità)
 from .tools import (
     generate_dss_report, read_kpi_data, read_social_data,read_env_data, generate_environment_report, generate_social_report, get_kpi_targets,
-    ping
+    ping1,ping2,ping3,ping4,ping5
 )
 
 
@@ -80,7 +80,7 @@ Mode = Literal["env", "social", "dss"]
 _MODE_CONFIG = {
     "env": {
         "system_message": AGENT_ENV_SYSTEM_MESSAGE,
-        "tools": [ping], #[read_env_data, generate_environment_report, get_kpi_targets],
+        "tools": [ping1,ping2,ping3,ping4,ping5], #[read_env_data, generate_environment_report, get_kpi_targets],
         "run_name": "ENV-Agent",
     },
     "social": {

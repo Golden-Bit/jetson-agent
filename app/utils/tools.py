@@ -1553,10 +1553,41 @@ class _PingArgs(BaseModel):
 def _ping_impl(_: _PingArgs) -> str:
     return "PONG"
 
-ping = StructuredTool.from_function(
+ping1 = StructuredTool.from_function(
     func=_wrap_args(_PingArgs, _ping_impl),
-    name="ping",
-    description="Tool di test: ritorna sempre 'PONG'. Nessun argomento.",
+    name="ping1",
+    description="Tool di test: ritorna sempre 'PONG1'. Nessun argomento.",
+    args_schema=_PingArgs,
+)
+
+ping2 = StructuredTool.from_function(
+    func=_wrap_args(_PingArgs, _ping_impl),
+    name="ping2",
+    description="Tool di test: ritorna sempre 'PONG2'. Nessun argomento.",
+    args_schema=_PingArgs,
+)
+
+
+ping3 = StructuredTool.from_function(
+    func=_wrap_args(_PingArgs, _ping_impl),
+    name="ping3",
+    description="Tool di test: ritorna sempre 'PONG3'. Nessun argomento.",
+    args_schema=_PingArgs,
+)
+
+
+ping4 = StructuredTool.from_function(
+    func=_wrap_args(_PingArgs, _ping_impl),
+    name="ping4",
+    description="Tool di test: ritorna sempre 'PONG4'. Nessun argomento.",
+    args_schema=_PingArgs,
+)
+
+
+ping5 = StructuredTool.from_function(
+    func=_wrap_args(_PingArgs, _ping_impl),
+    name="ping5",
+    description="Tool di test: ritorna sempre 'PONG5'. Nessun argomento.",
     args_schema=_PingArgs,
 )
 
