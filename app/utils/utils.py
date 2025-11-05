@@ -74,10 +74,10 @@ _llm = ChatOpenAI(
     # passa le opzioni di Ollama via extra_body
     #model_kwargs={"extra_body": {"options": {"num_ctx": 8192}}},
     extra_body={
-        "keep_alive": "0s",      # scarica subito il modello dopo la risposta
+        #"keep_alive": "0s",      # scarica subito il modello dopo la risposta
         "options": {
-            "num_ctx": 32768,    # max che il tuo build supporta
-            "num_keep": 2048,    # “ancora” il system per non farlo troncare
+            "num_ctx": 16000,    # max che il tuo build supporta
+            "num_keep": 4096,    # “ancora” il system per non farlo troncare
         }
     },
 )
