@@ -31,38 +31,16 @@ class Window(BaseModel):
     date_start: Optional[str] = None
     date_end:   Optional[str] = None
 
-    @root_validator
-    def _check_branch(cls, v):
-        by = v.get("by")
-        if by == "index":
-            if v.get("idx_start") is None or v.get("idx_end") is None:
-                raise ValueError("Con by='index' servono idx_start e idx_end")
-        else:
-            if not v.get("date_start") or not v.get("date_end"):
-                raise ValueError("Con by='date' servono date_start e date_end")
-        return v
-
 class Meta(BaseModel):
     source: Literal["ui","api","cron"] = "ui"
     priority: conint(ge=0, le=10) = 5
     ts_iso: Optional[str] = Field(None, description="Timestamp ISO; se assente viene impostato lato tool")
 
-    @validator("ts_iso", always=True)
-    def _default_ts(cls, v):
-        return v or datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 class Item(BaseModel):
     id: str = Field(..., min_length=1, max_length=64)
     value: Optional[confloat(ge=-1e9, le=1e9)] = None
     tags: List[str] = Field(default_factory=list, description="max 8 tag")
-
-    @validator("tags")
-    def _limit_tags(cls, v):
-        # limiti “soft” per aumentare la complessità dello schema
-        if len(v) > 8:
-            raise ValueError("Troppi tag (max 8)")
-        # normalizza tag
-        return [t.strip()[:32] for t in v]
 
 class PingComplexArgs(BaseModel):
     mode: Literal["ping","echo","checksum","stats"] = "ping"
@@ -71,14 +49,6 @@ class PingComplexArgs(BaseModel):
     meta: Meta = Field(default_factory=Meta)
     items: List[Item] = Field(default_factory=list)
     window: Optional[Window] = None  # opzionale, solo per “gonfiare” lo schema
-
-    @root_validator
-    def _guard_logic(cls, v):
-        m = v.get("mode")
-        msg = (v.get("message") or "").strip()
-        if m in ("echo","checksum") and not msg:
-            raise ValueError("Per mode=echo|checksum serve 'message' non vuoto")
-        return v
 
 # ─────────────────────────────────────────────────────────────────────────────
 # IMPLEMENTAZIONE
