@@ -73,7 +73,13 @@ _llm = ChatOpenAI(
     streaming=True,       # token streaming
     # passa le opzioni di Ollama via extra_body
     #model_kwargs={"extra_body": {"options": {"num_ctx": 8192}}},
-    extra_body={"options": {"num_ctx": 8192}},
+    extra_body={
+        "keep_alive": "0s",      # scarica subito il modello dopo la risposta
+        "options": {
+            "num_ctx": 32768,    # max che il tuo build supporta
+            "num_keep": 2048,    # “ancora” il system per non farlo troncare
+        }
+    },
 )
 
 # --------------------------------------------------------------------------
@@ -169,6 +175,10 @@ async def event_stream(user_text: str, chat_history: list[dict], mode: Mode = "e
     # Converti la history "plain" in LangChain messages (solo Human per semplicità).
     lc_history = []
     for m in chat_history:
+        print("*"*120)
+        print(m)
+        print("*"*120)
+
         if m.get("role") == "user":
             lc_history.append(HumanMessage(content=m.get("content", "")))
         # (Opzionale) Aggiungere AIMessage se serve più contesto
@@ -179,6 +189,11 @@ async def event_stream(user_text: str, chat_history: list[dict], mode: Mode = "e
             version="v2",
         ):
             etype = event["event"]
+
+            print("#"*120)
+            print(event)
+            print("#"*120)
+
             name  = event.get("name") or event.get("metadata", {}).get("name")
             data  = event.get("data", {}) or {}
             run_id = event.get("run_id")
