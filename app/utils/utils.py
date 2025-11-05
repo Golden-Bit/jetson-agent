@@ -38,6 +38,7 @@ from .system_message import (
     AGENT_SOC_SYSTEM_MESSAGE,
     AGENT_DSS_SYSTEM_MESSAGE,
 )
+from .test_tools import ping_complex
 
 # Import dei tool (uno per modalità)
 from .tools import (
@@ -70,6 +71,8 @@ _llm = ChatOpenAI(
     model_name=MODEL,     # alias per la tua classe
     temperature=TEMPERATURE,
     streaming=True,       # token streaming
+    # passa le opzioni di Ollama via extra_body
+    model_kwargs={"extra_body": {"options": {"num_ctx": 8192}}},
 )
 
 # --------------------------------------------------------------------------
@@ -80,7 +83,7 @@ Mode = Literal["env", "social", "dss"]
 _MODE_CONFIG = {
     "env": {
         "system_message": AGENT_ENV_SYSTEM_MESSAGE,
-        "tools": [ping1,ping2,ping3,ping4,ping5], #[read_env_data, generate_environment_report, get_kpi_targets],
+        "tools": [ping_complex], #[ping1,ping2,ping3,ping4,ping5], #[read_env_data, generate_environment_report, get_kpi_targets],
         "run_name": "ENV-Agent",
     },
     "social": {
