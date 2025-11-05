@@ -1,36 +1,38 @@
 # -*- coding: utf-8 -*-
 """
-Core agente con LangChain + Ollama (OpenAI-compat) e streaming eventi.
+Core agente (senza LangChain / senza tools) con OpenAI SDK (Ollama-compat) e streaming eventi.
 ➤ Selezione modalità: 'env' (Report Ambientale), 'social' (Report Sociale), 'dss' (Analisi DSS/AHP)
 
-- NON passiamo base_url/api_key a ChatOpenAI: letti da ENV
-  * OPENAI_BASE_URL (default: http://localhost:11434/v1)
-  * OPENAI_API_KEY  (default: "ollama")
-- Modello da ENV OLLAMA_MODEL (default: "qwen3:30b")
-- Ogni modalità usa:
-  • un proprio System Message (AGENT_ENV_SYSTEM_MESSAGE, AGENT_SOC_SYSTEM_MESSAGE, AGENT_DSS_SYSTEM_MESSAGE)
-  • il set di tool minimo necessario:
-      env  → [env_kpi_snapshot_tool]
-      social → [social_kpi_snapshot_tool]
-      dss  → [dss_compute_tool]
-- Async generator che emette eventi per la UI:
-    {"type": "token",      "text": "..."}                      # chunk testo
-    {"type": "tool_start", "name": "...", "inputs": {...}, "run_id": "..."}
-    {"type": "tool_end",   "name": "...", "inputs": {...}, "output": {...}, "run_id": "..."}
+- NON usiamo Agent/Tools; inviamo al modello solo:
+  • system message specifico per modalità
+  • chat_history (user/assistant così com’è)
+  • ultimo user_text
+
+- Streaming eventi verso la UI con schema invariato:
+    {"type": "token", "text": "...", "kind": "assistant"}   # chunk testo assistant
+    {"type": "token", "text": "...", "kind": "reasoning"}    # chunk reasoning (se disponibile)
     {"type": "done"}
     {"type": "error", "message": "..."}
+
+Env richieste & default:
+  OPENAI_BASE_URL  (default: http://127.0.0.1:11434/v1)
+  OPENAI_API_KEY   (default: ollama)
+  OLLAMA_MODEL     (default: qwen3:8b)
+  AGENT_TEMPERATURE (default: 0.2)
+  HIDE_THINK       (default: true)  # se true, NON emette reasoning
+  OLLAMA_KEEP_ALIVE (default: "0s") # 0s = scarica subito il modello (utile per debug)
+  OLLAMA_NUM_CTX   (default: 8192)
+  REASONING_EFFORT (default: "")    # es. "medium" (inoltrato come extra_body → "reasoning": {"effort": ...})
 """
 
+from __future__ import annotations
 import os
 import re
-from typing import AsyncIterator, Literal
-from datetime import datetime
-from pydantic import BaseModel, Field
+import json
+from typing import AsyncIterator, Literal, List, Dict, Any
 
-from langchain_openai import ChatOpenAI
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import HumanMessage
+from openai import OpenAI
+from langchain_core.messages import HumanMessage, AIMessage  # solo per compat con tua UI/history
 
 # Import dei TRE system message separati
 from .system_message import (
@@ -38,207 +40,174 @@ from .system_message import (
     AGENT_SOC_SYSTEM_MESSAGE,
     AGENT_DSS_SYSTEM_MESSAGE,
 )
-from .test_tools import ping_complex
 
-# Import dei tool (uno per modalità)
-from .tools import (
-    generate_dss_report, read_kpi_data, read_social_data,read_env_data, generate_environment_report, generate_social_report, get_kpi_targets,
-    ping1,ping2,ping3,ping4,ping5
-)
-
-
-# --------------------------------------------------------------------------
-# ENV / fallback per Ollama OpenAI-compat (nessuna vera API key richiesta)
-# --------------------------------------------------------------------------
-os.environ.setdefault("OPENAI_BASE_URL", "http://localhost:11434/v1")
-os.environ.setdefault("OPENAI_API_KEY", "ollama")  # dummy key
-
-MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b") #"llama3.1:8b-instruct-q4_K_M" #"llama3.3:70b-instruct-q4_K_M" #"qwen3:30b"
+# ─────────────────────────────────────────────────────────────────────────────
+# ENV / default per Ollama OpenAI-compat
+# ─────────────────────────────────────────────────────────────────────────────
+BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:11434/v1")
+API_KEY  = os.environ.get("OPENAI_API_KEY", "ollama")
+MODEL    = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
 TEMPERATURE = float(os.environ.get("AGENT_TEMPERATURE", "0.2"))
-HIDE_THINK = os.environ.get("HIDE_THINK", "true").lower() in ("1", "true", "yes")
+HIDE_THINK  = os.environ.get("HIDE_THINK", "true").lower() in ("1", "true", "yes")
 
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+KEEP_ALIVE  = os.environ.get("OLLAMA_KEEP_ALIVE", "0s")   # "0s" per debug; es. "5m" in prod
+NUM_CTX     = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
+REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "").strip()  # opzionale
 
-# --------------------------------------------------------------------------
-# LLM condiviso
-# --------------------------------------------------------------------------
+print("BASE_URL=", BASE_URL)
+print("API_KEY=", API_KEY)
+print("MODEL=", MODEL)
+print("KEEP_ALIVE=", KEEP_ALIVE)
+print("NUM_CTX=", NUM_CTX)
+print("HIDE_THINK=", HIDE_THINK)
+print("REASONING_EFFORT=", REASONING_EFFORT or "(none)")
 
-print("BASE_URL=", os.getenv("OPENAI_BASE_URL"))
-print("API_KEY=", os.getenv("OPENAI_API_KEY"))
-print("MODEL=", os.getenv("OLLAMA_MODEL", MODEL))
+client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
 
-_llm = ChatOpenAI(
-    model_name=MODEL,     # alias per la tua classe
-    temperature=TEMPERATURE,
-    streaming=True,       # token streaming
-    # passa le opzioni di Ollama via extra_body
-    #model_kwargs={"extra_body": {"options": {"num_ctx": 8192}}},
-    extra_body={
-        #"keep_alive": "0s",      # scarica subito il modello dopo la risposta
-        "options": {
-            "num_ctx": 16000,    # max che il tuo build supporta
-            "num_keep": 4096,    # “ancora” il system per non farlo troncare
-        }
-    },
-)
-
-# --------------------------------------------------------------------------
-# Config per modalità → system_message, tools, run_name
-# --------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Mode config → system_message
+# ─────────────────────────────────────────────────────────────────────────────
 Mode = Literal["env", "social", "dss"]
 
 _MODE_CONFIG = {
-    "env": {
-        "system_message": AGENT_ENV_SYSTEM_MESSAGE,
-        "tools": [generate_environment_report], #[ping_complex], #[ping1,ping2,ping3,ping4,ping5], #[read_env_data, generate_environment_report, get_kpi_targets],
-        "run_name": "ENV-Agent",
-    },
-    "social": {
-        "system_message": AGENT_SOC_SYSTEM_MESSAGE,
-        "tools": [read_social_data, generate_social_report, get_kpi_targets],
-        "run_name": "SOC-Agent",
-    },
-    "dss": {
-        "system_message": AGENT_DSS_SYSTEM_MESSAGE,
-        "tools": [generate_dss_report, get_kpi_targets],  # da riempire in seguito
-        "run_name": "DSS-Agent",
-    },
+    "env":   {"system_message": AGENT_ENV_SYSTEM_MESSAGE,  "run_name": "ENV-Agent"},
+    "social":{"system_message": AGENT_SOC_SYSTEM_MESSAGE,  "run_name": "SOC-Agent"},
+    "dss":   {"system_message": AGENT_DSS_SYSTEM_MESSAGE,  "run_name": "DSS-Agent"},
 }
 
-# Cache esecutori per modalità
-_EXECUTORS: dict[str, AgentExecutor] = {}
-_RUN_NAME_BY_MODE: dict[str, str] = {}
-
-def _build_executor(mode: Mode) -> AgentExecutor:
-    """Costruisce (e cache) un AgentExecutor per la modalità indicata."""
-    if mode in _EXECUTORS:
-        return _EXECUTORS[mode]
-
-    cfg = _MODE_CONFIG.get(mode)
-    if not cfg:
-        raise ValueError(f"Modalità non valida: {mode}. Valori ammessi: env | social | dss")
-
-    print(f"CFG= {cfg}")
-
-    system_message = cfg["system_message"]
-    tools = cfg["tools"]
-    run_name = cfg["run_name"]
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_message),
-        MessagesPlaceholder("chat_history"),
-        #("human", system_message),
-        ("human", "{input}"),
-        MessagesPlaceholder("agent_scratchpad"),
-    ])
-
-    agent = create_tool_calling_agent(_llm, tools, prompt)
-    executor: AgentExecutor = AgentExecutor(agent=agent, tools=tools).with_config({"run_name": run_name})
-
-    _EXECUTORS[mode] = executor
-    _RUN_NAME_BY_MODE[mode] = run_name
-    return executor
+# ─────────────────────────────────────────────────────────────────────────────
+# Utilità
+# ─────────────────────────────────────────────────────────────────────────────
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 def _strip_think(text: str) -> str:
-    if HIDE_THINK and text:
+    if text and HIDE_THINK:
         return _THINK_RE.sub("", text)
-    return text
+    return text or ""
 
-def _normalize_tool_inputs(data: dict) -> dict:
+def _build_messages(system_message: str, chat_history: List[Dict[str, Any]], user_text: str) -> List[Dict[str, str]]:
     """
-    Gli eventi LangChain per i tool espongono in genere 'input' (singolare).
-    In alcuni contesti si vede 'inputs'. Normalizziamo a 'inputs'.
+    Costruisce l'array messages per /chat/completions in questo ordine:
+      - system
+      - history (user / assistant così come sono, se presenti)
+      - ultimo user_text
     """
-    if data is None:
-        return {}
-    if "inputs" in data and isinstance(data["inputs"], dict):
-        return data["inputs"]
-    if "input" in data and isinstance(data["input"], dict):
-        return data["input"]
-    return {}
+    msgs: List[Dict[str, str]] = []
+    if system_message:
+        msgs.append({"role": "system", "content": system_message})
 
-# --------------------------------------------------------------------------
-# EVENT STREAM: genera eventi strutturati per la UI
-#   - chat_history: lista di dizionari [{"role":"user"|"assistant","content":"..."}]
-#   - mode: 'env' | 'social' | 'dss' → seleziona system message e tools specifici
-# --------------------------------------------------------------------------
+    # La tua UI passava in precedenza solo messaggi 'user' in lc_history; qui accettiamo anche 'assistant'
+    for m in chat_history or []:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if not content:
+            continue
+        # normalizza ruoli non standard
+        if isinstance(m, HumanMessage):
+            role, content = "user", m.content
+        elif isinstance(m, AIMessage):
+            role, content = "assistant", m.content
+        elif role not in ("user", "assistant", "system"):
+            role = "user"
+        msgs.append({"role": role, "content": str(content)})
+
+    # ultimo turno utente
+    if user_text:
+        msgs.append({"role": "user", "content": str(user_text)})
+    return msgs
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EVENT STREAM (UI contract invariato)
+# ─────────────────────────────────────────────────────────────────────────────
 async def event_stream(user_text: str, chat_history: list[dict], mode: Mode = "env") -> AsyncIterator[dict]:
-    """Async generator di eventi per Streamlit, con selettore di modalità (env|social|dss)."""
-    # Costruisci executor specifico per modalità
-    try:
-        executor = _build_executor(mode)
-        run_name = _RUN_NAME_BY_MODE.get(mode, "Agent")
-    except Exception as e:
-        yield {"type": "error", "message": f"Errore inizializzazione agente ({mode}): {e}"}
+    """
+    Async generator di eventi per Streamlit (nessun tool). Emissioni:
+      {"type":"token","text":"...","kind":"assistant"}
+      {"type":"token","text":"...","kind":"reasoning"}   # se disponibile e HIDE_THINK=false
+      {"type":"done"}
+      {"type":"error","message":"..."}
+    """
+    cfg = _MODE_CONFIG.get(mode)
+    if not cfg:
+        yield {"type": "error", "message": f"Modalità non valida: {mode}. Valori ammessi: env | social | dss"}
         return
 
-    # Converti la history "plain" in LangChain messages (solo Human per semplicità).
-    lc_history = []
-    for m in chat_history:
-        print("*"*120)
-        print(m)
-        print("*"*120)
+    system_message = cfg["system_message"]
+    run_name = cfg["run_name"]
 
-        if m.get("role") == "user":
-            lc_history.append(HumanMessage(content=m.get("content", "")))
-        # (Opzionale) Aggiungere AIMessage se serve più contesto
+    # Log di debug della history in ingresso
+    for m in chat_history or []:
+        print("*" * 120)
+        try:
+            print(json.dumps(m, ensure_ascii=False))
+        except Exception:
+            print(str(m))
+        print("*" * 120)
+
+    messages = _build_messages(system_message, chat_history, user_text)
+
+    # extra_body per Ollama-compat (options/keep_alive) + reasoning opzionale
+    extra_body = {
+        "options": {"num_ctx": NUM_CTX},
+        #"keep_alive": KEEP_ALIVE,
+    }
+    if REASONING_EFFORT:
+        # Alcuni backend supportano un campo "reasoning": {"effort": "..."} (sarà ignorato se non supportato)
+        extra_body["reasoning"] = {"effort": REASONING_EFFORT}
 
     try:
-        async for event in executor.astream_events(
-            {"input": user_text, "chat_history": lc_history},
-            version="v2",
-        ):
-            etype = event["event"]
+        # NB: nella SDK moderna è possibile passare extra_body direttamente
+        with client.chat.completions.create(
+            model=MODEL,
+            stream=True,
+            temperature=TEMPERATURE,
+            messages=messages,
+            extra_body=extra_body,   # inoltra options/keep_alive/reasoning a Ollama
+        ) as stream:
 
-            print("#"*120)
-            print(event)
-            print("#"*120)
+            # Accumulatori opzionali (se servono per debug)
+            # full_reasoning, full_text = [], []
 
-            name  = event.get("name") or event.get("metadata", {}).get("name")
-            data  = event.get("data", {}) or {}
-            run_id = event.get("run_id")
+            for ev in stream:
+                # Debug a console dell'evento grezzo
+                print("#" * 120)
+                print(ev)  # rappresentazione del ChatCompletionChunk
+                print("#" * 120)
 
-            # --- TOKEN STREAMING ---
-            if etype == "on_llm_new_token":
-                text = _strip_think(data.get("chunk", ""))
-                if text:
-                    yield {"type": "token", "text": text}
+                if not ev or not getattr(ev, "choices", None):
+                    continue
 
-            elif etype == "on_chat_model_stream":
-                chunk = data.get("chunk")
-                if chunk is not None:
-                    text = _strip_think(getattr(chunk, "content", "") or "")
-                    if text:
-                        yield {"type": "token", "text": text}
+                choice = ev.choices[0]
+                delta = getattr(choice, "delta", None)
+                finish = getattr(choice, "finish_reason", None)
 
-            # --- TOOL START / END ---
-            elif etype == "on_tool_start":
-                tool_name = name or "tool"
-                inputs = _normalize_tool_inputs(data)
-                yield {
-                    "type": "tool_start",
-                    "name": tool_name,
-                    "inputs": inputs,
-                    "run_id": run_id,
-                }
+                if delta:
+                    # 1) Reasoning tokens (se esistono e non nascosti)
+                    r = getattr(delta, "reasoning", None)
+                    if r and not HIDE_THINK:
+                        txt = _strip_think(r)
+                        if txt:
+                            # full_reasoning.append(txt)
+                            yield {"type": "token", "text": txt, "kind": "reasoning"}
 
-            elif etype == "on_tool_end":
-                tool_name = name or "tool"
-                inputs = _normalize_tool_inputs(data)  # molti backend ribadiscono gli input qui
-                output = data.get("output", "")
-                yield {
-                    "type": "tool_end",
-                    "name": tool_name,
-                    "inputs": inputs,
-                    "output": output,
-                    "run_id": run_id,
-                }
+                    # 2) Assistant content tokens
+                    c = getattr(delta, "content", None)
+                    if c:
+                        txt = _strip_think(c)
+                        if txt:
+                            # full_text.append(txt)
+                            yield {"type": "token", "text": txt, "kind": "assistant"}
 
-            # --- CHIUSURA CHAIN ---
-            elif etype == "on_chain_end" and (name == run_name or event.get("metadata", {}).get("name") == run_name):
-                yield {"type": "done"}
+                if finish == "stop":
+                    # Fine naturale della generazione
+                    yield {"type": "done"}
+
+        # In alcuni backend lo stop può non attivarsi: garantisci un done
+        # (se già emesso sopra, la UI ignorerà i duplicati)
+        yield {"type": "done"}
 
     except Exception as e:
+        # Errori di rete o di backend
         yield {"type": "error", "message": str(e)}
 
 __all__ = [

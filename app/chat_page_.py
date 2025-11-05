@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Sezione Chat:
+Sezione Chat (aggiornata con selettore agente):
 - Streaming token-by-token
 - Parser <think>...</think> (token-safe)
 - Expander '🧠 Thinking' e log strumenti
 - Persistenza messaggi (incl. think/tools)
-- Stesso meccanismo di "traccia strumenti nascosta" nella history inviata all'LLM
+- Traccia strumenti nascosta incorporata nella history inviata all'LLM
+- Selectbox in sidebar per scegliere l'agente: ENV | SOCIAL | DSS
+  ➜ il cambio agente **non** cancella la chat history; la chat resta visibile/riutilizzabile
 """
 import os
 import json
@@ -16,9 +18,11 @@ from typing import Dict, Any, List, Tuple
 # Non filtriamo i blocchi <think> nel core, così la UI li visualizza (puoi cambiarlo da ENV)
 os.environ.setdefault("HIDE_THINK", "false")
 
-# Import core (lascia invariato il tuo utils)
+# Import core (con event_stream(user_text, history, mode))
 from utils.utils import event_stream, MODEL
 
+
+# ============================== Utility ======================================
 
 def _truncate64(value: Any) -> str:
     """Converte in stringa (JSON se dict/list) e tronca a 64 caratteri + hint."""
@@ -70,19 +74,55 @@ def build_llm_history(ui_messages: List[Dict[str, Any]], flatten_assistant: bool
     return llm_hist
 
 
+# ============================== Stato & Costanti =============================
+
+AGENT_OPTIONS = {
+    "env":   {"label": "🌿 Report Ambientale (ENV)", "help": "KPI/trend ambientali e tabella report."},
+    "social":{"label": "👥 Report Sociale (SOCIAL)", "help": "KPI/trend sociali e tabella report."},
+    "dss":   {"label": "⚖️ DSS (AHP)",              "help": "Combina KPI ENV+SOC per ranking e score."},
+}
+
+def _ensure_session_defaults():
+    if "messages" not in st.session_state:
+        st.session_state.messages = []  # unica history condivisa tra modalità
+    if "show_thinking" not in st.session_state:
+        st.session_state.show_thinking = True
+    if "show_tools" not in st.session_state:
+        st.session_state.show_tools = True
+    if "agent_mode" not in st.session_state:
+        st.session_state.agent_mode = "env"  # default
+
+# ============================== Pagina Chat ==================================
+
 def render_chat_page():
-    st.title("🦙 Chat (LangChain + Tool Calling)")
+    _ensure_session_defaults()
+
+    st.title("Chat (LangChain + Tool Calling)")
     st.caption("Streaming, blocchi Thinking e log strumenti in-line (multi-tool).")
+
+    # ------------------------- Sidebar: selezione agente + opzioni -----------
     st.sidebar.markdown("---")
+    with st.sidebar.expander("Selezione agente", expanded=True):
+        # Trova index corrente per selectbox
+        modes = list(AGENT_OPTIONS.keys())
+        current_idx = modes.index(st.session_state.agent_mode) if st.session_state.agent_mode in modes else 0
+
+        # Selectbox con etichette leggibili
+        new_idx = st.selectbox(
+            "Modalità agente",
+            options=list(range(len(modes))),
+            index=current_idx,
+            format_func=lambda i: AGENT_OPTIONS[modes[i]]["label"],
+            help=AGENT_OPTIONS[modes[current_idx]]["help"],
+            key="agent_mode_selectbox",
+        )
+        # Aggiorna modalità senza toccare la history
+        st.session_state.agent_mode = modes[new_idx]
+        st.caption(f"Modalità attiva: **{AGENT_OPTIONS[st.session_state.agent_mode]['label']}**")
+
     with st.sidebar.expander("⚙️ Opzioni Chat", expanded=True):
         st.caption("Ollama OpenAI-compat: usa ENV OPENAI_BASE_URL / OPENAI_API_KEY")
         st.write(f"**Modello:** `{MODEL}`")
-
-        # Opzioni UI salvate in sessione
-        if "show_thinking" not in st.session_state:
-            st.session_state.show_thinking = True
-        if "show_tools" not in st.session_state:
-            st.session_state.show_tools = True
 
         st.session_state.show_thinking = st.toggle(
             "Mostra blocchi Thinking",
@@ -95,31 +135,39 @@ def render_chat_page():
             help="Se attivo, mostra un expander per ciascun tool invocato (input/output).",
         )
 
-        if st.button("🧹 Svuota chat"):
-            st.session_state.messages = []
-            st.rerun()
+        cols = st.columns(2)
+        with cols[0]:
+            if st.button("🧹 Svuota chat"):
+                st.session_state.messages = []
+                st.rerun()
+        with cols[1]:
+            st.caption("La history resta invariata quando cambi agente.")
 
-    # -------------------------------------------------------------------------
-    # Rendering storico messaggi
-    # -------------------------------------------------------------------------
+    # Badge modalità corrente sotto il titolo
+    _mode_badge = {
+        "env": "🌿 **ENV attivo** — Report Ambientale",
+        "social": "👥 **SOCIAL attivo** — Report Sociale",
+        "dss": "⚖️ **DSS attivo** — Analisi AHP",
+    }
+    st.markdown(_mode_badge.get(st.session_state.agent_mode, ""))
+
+    # ------------------------- Rendering storico messaggi ---------------------
     for m in st.session_state.messages:
         _render_message(m)
 
-    # -------------------------------------------------------------------------
-    # Input utente
-    # -------------------------------------------------------------------------
-    user_text = st.chat_input("Scrivi un messaggio...")
+    # ------------------------- Input utente -----------------------------------
+    user_text = st.chat_input("Scrivi un messaggio per l’agente selezionato…")
     if user_text:
         # Mostra subito il messaggio utente e persistilo
         with st.chat_message("user"):
             st.markdown(user_text)
         _append_user_message(user_text)
 
-        # Costruisci la history *solo per l'LLM*, con i tool inseriti nel testo (nascosti alla UI)
-        llm_history = build_llm_history(st.session_state.messages, flatten_assistant=True)
+        # Costruisci la history *per l'LLM*, con i tool inseriti nel testo (nascosti alla UI)
+        llm_history = build_llm_history(st.session_state.messages, flatten_assistant=False)
 
-        # Esegui agente e streamma la risposta
-        result = asyncio.run(_run_agent_and_stream(llm_history, user_text))
+        # Esegui agente e streamma la risposta (con modalità selezionata)
+        result = asyncio.run(_run_agent_and_stream(llm_history, user_text, st.session_state.agent_mode))
 
         # Persisti risposta assistant con Thinking/Tools salvati
         _append_assistant_message(
@@ -129,7 +177,7 @@ def render_chat_page():
         )
 
 
-# =============== Helpers interni (solo per questa pagina) ====================
+# ===================== Helpers interni (solo per questa pagina) ==============
 
 def _render_message(m: Dict[str, Any]):
     with st.chat_message(m["role"]):
@@ -192,12 +240,14 @@ def _stream_split_think(chunk: str, state: Dict[str, Any]) -> Tuple[str, str]:
 
     return visible_delta, think_delta
 
-async def _run_agent_and_stream(ui_history: List[Dict[str, Any]], user_text: str) -> Dict[str, Any]:
+
+async def _run_agent_and_stream(ui_history: List[Dict[str, Any]], user_text: str, mode: str) -> Dict[str, Any]:
     """
     Consuma event_stream(...) e aggiorna la UI:
       - scrive i token nel messaggio assistant
       - intercetta i blocchi <think>
       - crea expander per ciascun tool (multi-tool con run_id)
+    Passa la modalità selezionata (env|social|dss) al core.
     """
     final_text = ""
     think_text = ""
@@ -212,7 +262,7 @@ async def _run_agent_and_stream(ui_history: List[Dict[str, Any]], user_text: str
         tools_container = None
         tool_placeholders: Dict[str, Dict[str, Any]] = {}
 
-        async for ev in event_stream(user_text, ui_history):
+        async for ev in event_stream(user_text, ui_history, mode=mode):
             et = ev.get("type")
 
             if et == "token":
@@ -305,6 +355,8 @@ async def _run_agent_and_stream(ui_history: List[Dict[str, Any]], user_text: str
             elif et == "done":
                 break
 
-    return {"text": final_text.strip(),
-            "think": think_text.strip() if think_text else "",
-            "tools": tool_calls if tool_calls else []}
+    return {
+        "text": final_text.strip(),
+        "think": think_text.strip() if think_text else "",
+        "tools": tool_calls if tool_calls else [],
+    }

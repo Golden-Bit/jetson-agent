@@ -1,21 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-Sezione Chat (aggiornata con selettore agente):
+Sezione Chat (senza LangChain nel core; supporta reasoning separato):
 - Streaming token-by-token
-- Parser <think>...</think> (token-safe)
+- Supporta **due** modalità di reasoning:
+  1) NUOVO core → eventi `{"type":"token","kind":"reasoning","text":...}`
+  2) FALLBACK → reasoning incluso nel content tramite tag <think>...</think>
 - Expander '🧠 Thinking' e log strumenti
-- Persistenza messaggi (incl. think/tools)
-- Traccia strumenti nascosta incorporata nella history inviata all'LLM
-- Selectbox in sidebar per scegliere l'agente: ENV | SOCIAL | DSS
-  ➜ il cambio agente **non** cancella la chat history; la chat resta visibile/riutilizzabile
+- Persistenza messaggi (incl. think/tools) e traccia strumenti nascosta nella history
+- Selectbox per scegliere l'agente: ENV | SOCIAL | DSS (la history non viene resettata)
+
+Dipendenze:
+- `utils.utils.event_stream` (core che chiama OpenAI SDK/Ollama-compat)
+- `utils.utils.MODEL`
+
+Nota
+----
+Il toggle "Mostra blocchi Thinking" controlla solo la **visualizzazione** in UI.
+Il reasoning viene comunque salvato nel messaggio assistant (campo `think`).
 """
+
 import os
 import json
 import asyncio
 import streamlit as st
 from typing import Dict, Any, List, Tuple
 
-# Non filtriamo i blocchi <think> nel core, così la UI li visualizza (puoi cambiarlo da ENV)
+# Non filtriamo i blocchi <think> nel core, così la UI li può visualizzare se arrivano nel content
 os.environ.setdefault("HIDE_THINK", "false")
 
 # Import core (con event_stream(user_text, history, mode))
@@ -35,9 +45,10 @@ def _truncate64(value: Any) -> str:
         s = repr(value)
     return s[:64] + ".....(OUTPUT TRONCATO A 64 CARATTERI, SE SI NECESSITA NUOVAMENTE L'OUTPUT INTEGRALE ALLORA RIESEGUIRE LO STRUMENTO!)"
 
+
 def _hidden_tool_trace_for_msg(msg: Dict[str, Any]) -> str:
     """
-    Blocca una traccia strumenti nel testo (invisibile in UI, visibile all'LLM).
+    Inserisce una traccia strumenti nel testo (invisibile in UI, visibile all'LLM).
     """
     tools = msg.get("tools") or []
     if not tools:
@@ -57,10 +68,11 @@ def _hidden_tool_trace_for_msg(msg: Dict[str, Any]) -> str:
     lines.append("TOOL_TRACE_END -->")
     return "\n".join(lines)
 
-def build_llm_history(ui_messages: List[Dict[str, Any]], flatten_assistant: bool = True) -> List[Dict[str, Any]]:
+
+def build_llm_history(ui_messages: List[Dict[str, Any]], *, flatten_assistant: bool = False) -> List[Dict[str, Any]]:
     """
-    Ritorna una *copia* della history con il riepilogo strumenti appeso nel testo,
-    opzionalmente "appiattendo" i messaggi assistant come 'user' per compatibilità con il core.
+    Ritorna una *copia* della history con il riepilogo strumenti appeso nel testo.
+    Se `flatten_assistant=True`, i messaggi assistant diventano 'user' (legacy). Di default **NO**.
     """
     llm_hist: List[Dict[str, Any]] = []
     for m in ui_messages:
@@ -69,6 +81,9 @@ def build_llm_history(ui_messages: List[Dict[str, Any]], flatten_assistant: bool
         tool_block = _hidden_tool_trace_for_msg(m)
         content_aug = (content + ("\n" + tool_block if tool_block else "")).strip()
         if flatten_assistant and role == "assistant":
+            role = "user"
+        # Normalizza minimo indispensabile
+        if role not in ("user", "assistant", "system"):
             role = "user"
         llm_hist.append({"role": role, "content": content_aug})
     return llm_hist
@@ -82,6 +97,7 @@ AGENT_OPTIONS = {
     "dss":   {"label": "⚖️ DSS (AHP)",              "help": "Combina KPI ENV+SOC per ranking e score."},
 }
 
+
 def _ensure_session_defaults():
     if "messages" not in st.session_state:
         st.session_state.messages = []  # unica history condivisa tra modalità
@@ -92,13 +108,14 @@ def _ensure_session_defaults():
     if "agent_mode" not in st.session_state:
         st.session_state.agent_mode = "env"  # default
 
+
 # ============================== Pagina Chat ==================================
 
 def render_chat_page():
     _ensure_session_defaults()
 
-    st.title("Chat (LangChain + Tool Calling)")
-    st.caption("Streaming, blocchi Thinking e log strumenti in-line (multi-tool).")
+    st.title("Chat (Core OpenAI compat, reasoning separato)")
+    st.caption("Streaming, blocchi Thinking separati o via <think>…</think>, log strumenti.")
 
     # ------------------------- Sidebar: selezione agente + opzioni -----------
     st.sidebar.markdown("---")
@@ -127,7 +144,7 @@ def render_chat_page():
         st.session_state.show_thinking = st.toggle(
             "Mostra blocchi Thinking",
             value=st.session_state.show_thinking,
-            help="Se attivo, mostra un expander '🧠 Thinking' col contenuto tra <think>...</think>.",
+            help="Se attivo, mostra un expander '🧠 Thinking' con i ragionamenti.",
         )
         st.session_state.show_tools = st.toggle(
             "Mostra log strumenti",
@@ -164,9 +181,9 @@ def render_chat_page():
         _append_user_message(user_text)
 
         # Costruisci la history *per l'LLM*, con i tool inseriti nel testo (nascosti alla UI)
-        llm_history = build_llm_history(st.session_state.messages, flatten_assistant=True)
+        llm_history = build_llm_history(st.session_state.messages, flatten_assistant=False)
 
-        # Esegui agente e streamma la risposta (con modalità selezionata)
+        # Esegui core e streamma la risposta (con modalità selezionata)
         result = asyncio.run(_run_agent_and_stream(llm_history, user_text, st.session_state.agent_mode))
 
         # Persisti risposta assistant con Thinking/Tools salvati
@@ -202,19 +219,23 @@ def _render_message(m: Dict[str, Any]):
                         st.markdown("**Output**")
                         st.code(t.get("output", ""), language="json")
 
+
 def _append_user_message(content: str):
     st.session_state.messages.append(
         {"role": "user", "content": content, "think": None, "tools": None}
     )
+
 
 def _append_assistant_message(content: str, think: str | None, tools: list | None):
     st.session_state.messages.append(
         {"role": "assistant", "content": content, "think": think, "tools": tools}
     )
 
+
 def _stream_split_think(chunk: str, state: Dict[str, Any]) -> Tuple[str, str]:
     """
     Parser in streaming per separare testo vs <think>...</think> (token-safe).
+    Ritorna (visible_delta, think_delta).
     """
     visible_delta = ""
     think_delta = ""
@@ -245,9 +266,9 @@ async def _run_agent_and_stream(ui_history: List[Dict[str, Any]], user_text: str
     """
     Consuma event_stream(...) e aggiorna la UI:
       - scrive i token nel messaggio assistant
-      - intercetta i blocchi <think>
+      - intercetta i blocchi di reasoning separati (kind="reasoning")
+      - fallback: separa <think>...</think> dal content assistant
       - crea expander per ciascun tool (multi-tool con run_id)
-    Passa la modalità selezionata (env|social|dss) al core.
     """
     final_text = ""
     think_text = ""
@@ -264,20 +285,46 @@ async def _run_agent_and_stream(ui_history: List[Dict[str, Any]], user_text: str
 
         async for ev in event_stream(user_text, ui_history, mode=mode):
             et = ev.get("type")
+            kind = ev.get("kind")  # "assistant" | "reasoning" | None (fallback)
 
             if et == "token":
                 chunk = ev.get("text", "")
+
+                # ====== NUOVO: stream reasoning separato quando il core lo fornisce ======
+                if kind == "reasoning":
+                    # Accumula sempre; mostra solo se il toggle è attivo
+                    think_text += chunk
+                    if st.session_state.get("show_thinking"):
+                        if think_expander is None:
+                            think_expander = st.expander("🧠 Thinking", expanded=False)
+                            think_ph = think_expander.empty()
+                        think_ph.markdown(think_text)
+                    continue  # non mischiare nel testo visibile
+
+                # ====== OLD/FALLBACK: parsing dei tag <think> dentro il content assistant ======
                 vis, th = _stream_split_think(chunk, parse_state)
+
+                # testo visibile
                 if vis:
                     final_text += vis
                     text_ph.markdown(final_text)
-                if (th or parse_state["in_think"]) and st.session_state.get("show_thinking"):
+
+                # thinking estratto dai tag <think>...</think>
+                if th:
+                    think_text += th
+                    if st.session_state.get("show_thinking"):
+                        if think_expander is None:
+                            think_expander = st.expander("🧠 Thinking", expanded=False)
+                            think_ph = think_expander.empty()
+                        think_ph.markdown(think_text)
+
+                # se siamo *ancora* dentro <think>, aggiorna live l’expander (se visibile)
+                if parse_state["in_think"] and st.session_state.get("show_thinking"):
                     if think_expander is None:
                         think_expander = st.expander("🧠 Thinking", expanded=False)
                         think_ph = think_expander.empty()
-                    if th:
-                        think_text += th
-                        think_ph.markdown(think_text)
+                    # Forziamo il render dell'attuale contenuto accumulato
+                    think_ph.markdown(think_text)
 
             elif et == "tool_start":
                 tname = ev.get("name", "tool")
