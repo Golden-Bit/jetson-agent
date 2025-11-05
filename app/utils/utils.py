@@ -165,8 +165,8 @@ async def event_stream(user_text: str, chat_history: list[dict], mode: Mode = "e
 
     # ⬇️ Inietta SOLO nella chiamata API una coppia user+assistant di placeholder
     placeholder_turn = [
-        {"role": "user", "content": PH_USER_TEXT[mode]},
-        {"role": "assistant", "content": PH_ASSISTANT_TEXT[mode]},
+        {"role": "user", "content": "MI CHIAMO MARIO!"}, # PH_USER_TEXT[mode]},
+        {"role": "assistant", "content": "OK!" } #PH_ASSISTANT_TEXT[mode]},
     ]
     messages_for_call = messages[:-1] + placeholder_turn + messages[-1:]  # <-- NON tocca chat_history né la persistenza
 
