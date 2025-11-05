@@ -59,7 +59,7 @@ REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "").strip()  # opzionale
 
 # --- Placeholder turn per modalità (SOLO per la chiamata API; NON persistono)  # NEW
 PH_USER_TEXT: Dict[str, str] = {  # NEW
-    "env":   "Effettua un recupero dele ultime 10 misurazioni dei dati ambientali, dunque poi genera los scheletro del report ambientale. Successivamente ogni qual volta ti venga chiesto di generare il report ambientale (nei emssaggi successivi) allora dovrai mostrare il medesimo report, analogamente se ti vengono cheisti i dati. inoltre dovrai msotrare all'utente i dat in formato ben visibile e ad esmepio non dovtrai mostrare i json grezzi ma testo ben formattato.",
+    "env":   "Effettua un recupero dele ultime 10 misurazioni dei dati ambientali, dunque poi genera los scheletro del report ambientale. Successivamente ogni qual volta ti venga chiesto di generare il report ambientale (nei emssaggi successivi) allora dovrai mostrare il medesimo report, analogamente se ti vengono cheisti i dati. inoltre dovrai msotrare all'utente i dat in formato ben visibile e ad esempio non dovtrai mostrare i json grezzi ma testo ben formattato.",
     "social":"",
     "dss":   "",
 }
