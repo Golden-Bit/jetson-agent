@@ -73,6 +73,7 @@ _llm = ChatOpenAI(
     streaming=True,       # token streaming
     # passa le opzioni di Ollama via extra_body
     model_kwargs={"extra_body": {"options": {"num_ctx": 8192}}},
+    extra_body={"options": {"num_ctx": 8192}},
 )
 
 # --------------------------------------------------------------------------
