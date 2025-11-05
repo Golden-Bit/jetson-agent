@@ -40,6 +40,8 @@ from .system_message import (
     AGENT_SOC_SYSTEM_MESSAGE,
     AGENT_DSS_SYSTEM_MESSAGE,
 )
+from .tools import generate_environment_report_tool, EnvReportArgs, read_env_data_tool, ReadEnvDataArgs, \
+    get_kpi_targets_tool, GetTargetsArgs
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENV / default per Ollama OpenAI-compat
@@ -53,6 +55,21 @@ HIDE_THINK  = os.environ.get("HIDE_THINK", "true").lower() in ("1", "true", "yes
 KEEP_ALIVE  = os.environ.get("OLLAMA_KEEP_ALIVE", "0s")   # "0s" per debug; es. "5m" in prod
 NUM_CTX     = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
 REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "").strip()  # opzionale
+
+
+# --- Placeholder turn per modalità (SOLO per la chiamata API; NON persistono)  # NEW
+PH_USER_TEXT: Dict[str, str] = {  # NEW
+    "env":   "Effettua un recupero dele ultime 10 misurazioni dei dati ambientali, dunque poi genera los scheletro del report ambientale. Successivamente ogni qual volta ti venga chiesto di generare il report ambientale (nei emssaggi successivi) allora dovrai mostrare il medesimo report, analogamente se ti vengono cheisti i dati. inoltre dovrai msotrare all'utente i dat in formato ben visibile e ad esmepio non dovtrai mostrare i json grezzi ma testo ben formattato.",
+    "social":"",
+    "dss":   "",
+}
+
+PH_ASSISTANT_TEXT: Dict[str, str] = {  # NEW
+    "env":   f"Perfetto, di seguito ti mostro i dati letti e il relativo report \n\n '''DATI: {read_env_data_tool(args=ReadEnvDataArgs())}''', \n\n inoltre ti mostro kpi targets \n\n KPI TARGETS: {get_kpi_targets_tool(args=GetTargetsArgs())}''' \n\n Ed infine lo scheletro del report \n\n'''SCHELETRO REPORT: {generate_environment_report_tool(args=EnvReportArgs())}'''",
+    "social":"",
+    "dss":   "",
+}
+
 
 print("BASE_URL=", BASE_URL)
 print("API_KEY=", API_KEY)
@@ -146,6 +163,18 @@ async def event_stream(user_text: str, chat_history: list[dict], mode: Mode = "e
 
     messages = _build_messages(system_message, chat_history, user_text)
 
+    # ⬇️ Inietta SOLO nella chiamata API una coppia user+assistant di placeholder
+    placeholder_turn = [
+        {"role": "user", "content": PH_USER_TEXT[mode]},
+        {"role": "assistant", "content": PH_ASSISTANT_TEXT[mode]},
+    ]
+    messages_for_call = messages[:-1] + placeholder_turn + messages[-1:]  # <-- NON tocca chat_history né la persistenza
+
+    for m in messages_for_call:
+        print("#*"*120)
+        print(m)
+        print("#*" * 120)
+
     # extra_body per Ollama-compat (options/keep_alive) + reasoning opzionale
     extra_body = {
         "options": {"num_ctx": NUM_CTX},
@@ -161,7 +190,7 @@ async def event_stream(user_text: str, chat_history: list[dict], mode: Mode = "e
             model=MODEL,
             stream=True,
             temperature=TEMPERATURE,
-            messages=messages,
+            messages=messages_for_call,
             extra_body=extra_body,   # inoltra options/keep_alive/reasoning a Ollama
         ) as stream:
 

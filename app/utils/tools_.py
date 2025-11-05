@@ -317,16 +317,16 @@ class ReadKpiDataArgs(BaseModel):
         description="Filtro stabilimento (solo SOCIAL).",
         json_schema_extra={"example": "Stabilimento_Lino_B"},
     )
-    #fields: Optional[List[str]] = Field(
-    #    default_factory=list,
-    #    description="Proiezione campi (vuoto = tutti).",
-    #    json_schema_extra={"example": ["timestamp", "temperature", "humidity"]},
-    #)
-    #order: Literal["desc", "asc"] = Field(
-    #    default="desc",
-    #    description="Ordinamento del risultato.",
-    #    json_schema_extra={"example": "desc"},
-    #)
+    fields: Optional[List[str]] = Field(
+        default_factory=list,
+        description="Proiezione campi (vuoto = tutti).",
+        json_schema_extra={"example": ["timestamp", "temperature", "humidity"]},
+    )
+    order: Literal["desc", "asc"] = Field(
+        default="desc",
+        description="Ordinamento del risultato.",
+        json_schema_extra={"example": "desc"},
+    )
 
     class Config:
         schema_extra = {

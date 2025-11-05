@@ -354,16 +354,16 @@ class ReadKpiDataArgs(BaseModel):
         description="Filtro stabilimento (solo SOCIAL).",
         json_schema_extra={"example": "Stabilimento_Lino_B"},
     )
-    #fields: Optional[List[str]] = Field(
-    #    default_factory=list,
-    #    description="Proiezione campi (vuoto = tutti).",
-    #    json_schema_extra={"example": ["timestamp", "temperature", "humidity"]},
-    #)
-    #order: Literal["desc", "asc"] = Field(
-    #    default="desc",
-    #    description="Ordinamento del risultato.",
-    #    json_schema_extra={"example": "desc"},
-    #)
+    fields: Optional[List[str]] = Field(
+        default_factory=list,
+        description="Proiezione campi (vuoto = tutti).",
+        json_schema_extra={"example": ["timestamp", "temperature", "humidity"]},
+    )
+    order: Literal["desc", "asc"] = Field(
+        default="desc",
+        description="Ordinamento del risultato.",
+        json_schema_extra={"example": "desc"},
+    )
 
     class Config:
         schema_extra = {
@@ -509,7 +509,7 @@ class EnvReportArgs(BaseModel):
         json_schema_extra={"example": 0},
     )
     idx_end: Optional[int] = Field(
-        default=0,
+        default=1440,
         ge=0,
         description="Indice di fine incluso (solo by='index').",
         json_schema_extra={"example": 1440},
@@ -1058,7 +1058,7 @@ class ReadEnvDataArgs(BaseModel):
         json_schema_extra={"example": 0},
     )
     idx_end: Optional[int] = Field(
-        default=0, ge=0, description="Indice di fine incluso (solo by='index').",
+        default=10, ge=0, description="Indice di fine incluso (solo by='index').",
         json_schema_extra={"example": 300},
     )
     date_start: Optional[str] = Field(
