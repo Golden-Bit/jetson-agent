@@ -84,7 +84,7 @@ Mode = Literal["env", "social", "dss"]
 _MODE_CONFIG = {
     "env": {
         "system_message": AGENT_ENV_SYSTEM_MESSAGE,
-        "tools": [ping_complex], #[ping1,ping2,ping3,ping4,ping5], #[read_env_data, generate_environment_report, get_kpi_targets],
+        "tools": [generate_environment_report], #[ping_complex], #[ping1,ping2,ping3,ping4,ping5], #[read_env_data, generate_environment_report, get_kpi_targets],
         "run_name": "ENV-Agent",
     },
     "social": {
