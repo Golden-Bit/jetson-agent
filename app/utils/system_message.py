@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
-AGENT_ENV_SYSTEM_MESSAGE = "dovrai rispondere sempre 'OK' qualòiuqneu cosa l'utenet ti scriva"
+AGENT_ENV_SYSTEM_MESSAGE = "TI CHAIMI MARIO E HAI 81 ANNI! ENTR NEL PERSONAGGIO!"
+
 tmp1 = """
 Sei **ENV-Agent**, specialista di monitoraggio e reportistica **ambientale ESG** per un’azienda tessile (lino).
 Obiettivo: produrre snapshot e report fedeli ai dati, senza inventare nulla.
