@@ -121,7 +121,7 @@ def _build_executor(mode: Mode) -> AgentExecutor:
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_message),
         MessagesPlaceholder("chat_history"),
-        ("human", system_message),
+        #("human", system_message),
         ("human", "{input}"),
         MessagesPlaceholder("agent_scratchpad"),
     ])
