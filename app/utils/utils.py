@@ -41,7 +41,8 @@ from .system_message import (
     AGENT_DSS_SYSTEM_MESSAGE,
 )
 from .tools import generate_environment_report_tool, EnvReportArgs, read_env_data_tool, ReadEnvDataArgs, \
-    get_kpi_targets_tool, GetTargetsArgs, generate_social_report_tool, SocialReportArgs
+    get_kpi_targets_tool, GetTargetsArgs, generate_social_report_tool, SocialReportArgs, generate_dss_report_tool, \
+    DSSReportArgs
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENV / default per Ollama OpenAI-compat
@@ -61,14 +62,14 @@ REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "").strip()  # opzionale
 PH_USER_TEXT: Dict[str, str] = {  # NEW
     "env":   "Sei un assistente ESG specializzato nella generazione di report ambientali per un azienda nel campo tessile.Genera report ambientale nel prossimo emssaggio. Successivamente ogni qual volta ti venga chiesto di generare il report ambientale (nei emssaggi successivi) allora dovrai mostrare il medesimo report usando anche gli stessi dati ottenuti nel report generato nella tua risposta a tale messaggio. inoltre dovrai mostrare all'utente i dati in formato ben visibile e ad esempio non dovtrai mostrare i json grezzi ma testo ben formattato.",
     "social":"Sei un assistente ESG specializzato nella generazione di report sociali per un azienda nel campo tessile.Genera report sociale nel prossimo emssaggio. Successivamente ogni qual volta ti venga chiesto di generare il report ambientale (nei emssaggi successivi) allora dovrai mostrare il medesimo report usando anche gli stessi dati ottenuti nel report generato nella tua risposta a tale messaggio. inoltre dovrai mostrare all'utente i dati in formato ben visibile e ad esempio non dovtrai mostrare i json grezzi ma testo ben formattato.",
-    "dss":   "",
+    "dss":   "Sei un assistente ESG specializzato nella generazione di report DSS per un azienda nel campo tessile.Genera report DSS nel prossimo emssaggio. Successivamente ogni qual volta ti venga chiesto di generare il report DSS (nei emssaggi successivi) allora dovrai mostrare il medesimo report usando anche gli stessi dati ottenuti nel report generato nella tua risposta a tale messaggio. inoltre dovrai mostrare all'utente i dati in formato ben visibile e ad esempio non dovtrai mostrare i json grezzi ma testo ben formattato.",
 }
 
 PH_ASSISTANT_TEXT: Dict[str, str] = {  # NEW
     #"env":   f"Perfetto, di seguito ti mostro i dati letti e il relativo report \n\n '''DATI: {read_env_data_tool(args=ReadEnvDataArgs())}''', \n\n inoltre ti mostro kpi targets \n\n KPI TARGETS: {get_kpi_targets_tool(args=GetTargetsArgs())}''' \n\n Ed infine lo scheletro del report \n\n'''SCHELETRO REPORT: {generate_environment_report_tool(args=EnvReportArgs())}'''",
     "env":   f"Perfetto, di seguito ti mostro i dati letti e il relativo report. \n\n'''SCHELETRO REPORT: {generate_environment_report_tool(args=EnvReportArgs())}'''",
     "social":f"Perfetto, di seguito ti mostro i dati letti e il relativo report. \n\n'''SCHELETRO REPORT: {generate_social_report_tool(args=SocialReportArgs())}'''",
-    "dss":   "",
+    "dss":   f"Perfetto, di seguito ti mostro i dati letti e il relativo report. \n\n'''SCHELETRO REPORT: {generate_dss_report_tool(args=DSSReportArgs())}'''",
 }
 
 

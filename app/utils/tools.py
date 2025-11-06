@@ -1182,7 +1182,7 @@ class DSSReportArgs(BaseModel):
     """Input per generare report DSS (AHP) con categorie ENV/SOC/FIN usando solo default interni."""
     by: Literal["index", "date"] = Field(default="index", description="Selezione dati ENV/SOC.")
     idx_start: Optional[int] = Field(default=0, ge=0, description="Indice inizio (solo by='index').")
-    idx_end: Optional[int] = Field(default=0, ge=0, description="Indice fine incluso (solo by='index').")
+    idx_end: Optional[int] = Field(default=0, ge=1440, description="Indice fine incluso (solo by='index').")
     date_start: Optional[str] = Field(default=None, description="Data/DateTime inizio (solo by='date').")
     date_end: Optional[str] = Field(default=None, description="Data/DateTime fine inclusiva (solo by='date').")
     facility: Optional[str] = Field(default="", description="Filtro stabilimento per SOCIAL (opzionale).")
