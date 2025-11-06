@@ -321,7 +321,7 @@ def render_chat_page():
         unsafe_allow_html=True,
     )
 
-    st.title("Chat (Core OpenAI compat, reasoning separato)")
+    st.title("Chat")
     st.caption("Streaming, blocchi Thinking separati o via <think>…</think>, log strumenti, gestione chat multiple.")
 
     # ------------------------- Sidebar: selezione agente + opzioni + chats ----
@@ -358,7 +358,7 @@ def render_chat_page():
 
         cols = st.columns(2)
         with cols[0]:
-            if st.button("🧹 Svuota messaggi (solo corrente)"):
+            if st.button("🧹 Svuota chat"):
                 st.session_state.messages = []
                 _save_current_chat()
                 st.rerun()
