@@ -751,7 +751,7 @@ class SocialReportArgs(BaseModel):
         json_schema_extra={"example": 0},
     )
     idx_end: Optional[int] = Field(
-        default=0,
+        default=3,
         ge=0,
         description="Indice di fine incluso (solo by='index').",
         json_schema_extra={"example": 3},
