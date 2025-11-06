@@ -48,7 +48,7 @@ from .tools import generate_environment_report_tool, EnvReportArgs, read_env_dat
 # ─────────────────────────────────────────────────────────────────────────────
 BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:11434/v1")
 API_KEY  = os.environ.get("OPENAI_API_KEY", "ollama")
-MODEL    = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
+MODEL    = os.environ.get("OLLAMA_MODEL", "llama3:8b") #"qwen3:8b")
 TEMPERATURE = float(os.environ.get("AGENT_TEMPERATURE", "0.2"))
 HIDE_THINK  = os.environ.get("HIDE_THINK", "true").lower() in ("1", "true", "yes")
 

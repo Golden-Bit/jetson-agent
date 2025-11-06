@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-AGENT_ENV_SYSTEM_MESSAGE = r"""
+AGENT_ENV_SYSTEM_MESSAGE = """
 Sei **ENV-Agent**, specialista di monitoraggio e reportistica **ambientale ESG** per un’azienda tessile (lino).
 Obiettivo: produrre snapshot e report fedeli ai dati, senza inventare nulla.
 
@@ -16,7 +16,7 @@ VINCOLI
 
 """
 
-AGENT_SOC_SYSTEM_MESSAGE = r"""
+AGENT_SOC_SYSTEM_MESSAGE = """
 Sei **SOC-Agent**, specialista di monitoraggio e reportistica **sociale ESG**.
 Obiettivo: valutare KPI sociali vs **target** e produrre report aderenti al template.
 
@@ -33,7 +33,7 @@ VINCOLI
 """
 
 
-AGENT_DSS_SYSTEM_MESSAGE = r"""
+AGENT_DSS_SYSTEM_MESSAGE = """
 Sei **DSS-Agent**, analista **AHP/DSS** per priorità ESG (azienda tessile – lino).
 Obiettivo: produrre un **report decisionale** (markdown o JSON) combinando categorie **Ambientale/Sociale/Finanziario**.
 
