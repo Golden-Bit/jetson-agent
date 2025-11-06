@@ -65,7 +65,8 @@ PH_USER_TEXT: Dict[str, str] = {  # NEW
 }
 
 PH_ASSISTANT_TEXT: Dict[str, str] = {  # NEW
-    "env":   f"Perfetto, di seguito ti mostro i dati letti e il relativo report \n\n '''DATI: {read_env_data_tool(args=ReadEnvDataArgs())}''', \n\n inoltre ti mostro kpi targets \n\n KPI TARGETS: {get_kpi_targets_tool(args=GetTargetsArgs())}''' \n\n Ed infine lo scheletro del report \n\n'''SCHELETRO REPORT: {generate_environment_report_tool(args=EnvReportArgs())}'''",
+    #"env":   f"Perfetto, di seguito ti mostro i dati letti e il relativo report \n\n '''DATI: {read_env_data_tool(args=ReadEnvDataArgs())}''', \n\n inoltre ti mostro kpi targets \n\n KPI TARGETS: {get_kpi_targets_tool(args=GetTargetsArgs())}''' \n\n Ed infine lo scheletro del report \n\n'''SCHELETRO REPORT: {generate_environment_report_tool(args=EnvReportArgs())}'''",
+    "env":   f"Perfetto, di seguito ti mostro i dati letti e il relativo report. \n\n'''SCHELETRO REPORT: {generate_environment_report_tool(args=EnvReportArgs())}'''",
     "social":"",
     "dss":   "",
 }
@@ -165,8 +166,8 @@ async def event_stream(user_text: str, chat_history: list[dict], mode: Mode = "e
 
     # ⬇️ Inietta SOLO nella chiamata API una coppia user+assistant di placeholder
     placeholder_turn = [
-        {"role": "user", "content": "MI CHIAMO MARIO!"}, # PH_USER_TEXT[mode]},
-        {"role": "assistant", "content": "OK!" } #PH_ASSISTANT_TEXT[mode]},
+        {"role": "user", "content": PH_USER_TEXT[mode]},
+        {"role": "assistant", "content": PH_ASSISTANT_TEXT[mode]},
     ]
     messages_for_call = messages[:-1] + placeholder_turn + messages[-1:]  # <-- NON tocca chat_history né la persistenza
 
