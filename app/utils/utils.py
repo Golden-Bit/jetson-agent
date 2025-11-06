@@ -179,7 +179,7 @@ async def event_stream(user_text: str, chat_history: list[dict], mode: Mode = "e
     # extra_body per Ollama-compat (options/keep_alive) + reasoning opzionale
     extra_body = {
         "options": {"num_ctx": NUM_CTX},
-        #"keep_alive": KEEP_ALIVE,
+        "keep_alive": KEEP_ALIVE,
     }
     if REASONING_EFFORT:
         # Alcuni backend supportano un campo "reasoning": {"effort": "..."} (sarà ignorato se non supportato)
